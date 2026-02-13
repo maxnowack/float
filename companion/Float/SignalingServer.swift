@@ -2,7 +2,7 @@ import Combine
 import Foundation
 import Network
 
-private let protocolDebugLoggingEnabled = false
+private let protocolDebugLoggingEnabled = true
 
 @MainActor
 final class SignalingServer: ObservableObject {
@@ -50,6 +50,9 @@ final class SignalingServer: ObservableObject {
         }
         receiver.onStreamingChanged = { [weak self] isStreaming in
             Task { @MainActor [weak self] in
+                if protocolDebugLoggingEnabled {
+                    print("[Float Signal] receiver.onStreamingChanged value=\(isStreaming)")
+                }
                 self?.isStreaming = isStreaming
             }
         }
@@ -105,6 +108,9 @@ final class SignalingServer: ObservableObject {
     }
 
     func requestStop() {
+        if protocolDebugLoggingEnabled {
+            print("[Float Signal] requestStop called")
+        }
         webRTCReceiver.stop()
         isStreaming = false
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])

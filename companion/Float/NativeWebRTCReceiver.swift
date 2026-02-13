@@ -25,6 +25,13 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
 
     override init() {
         super.init()
+        pipController.onPictureInPictureClosed = { [weak self] in
+            guard let self else { return }
+            if pipDebugLoggingEnabled {
+                print("[Float PiP] receiver.pip-closed externally=true action=stop")
+            }
+            self.stop()
+        }
         sampleBufferRenderer.onVideoSizeChanged = { [weak self] size in
             Task { @MainActor [weak self] in
                 self?.pipController.updateExpectedVideoSize(size)
@@ -660,12 +667,22 @@ private final class WebRTCSampleBufferRenderer: NSObject, RTCVideoRenderer {
 
 @MainActor
 private final class NativePiPController: NSObject, AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate {
+    var onPictureInPictureClosed: (() -> Void)?
+
     private let sampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
     private var pipController: AVPictureInPictureController?
     private var privatePiPFrameworkHandle: UnsafeMutableRawPointer?
     private var privatePiPController: NSObject?
     private var privatePiPPresented = false
+    private var isStoppingPrivatePiPProgrammatically = false
     private var privatePiPContentViewController = NSViewController()
+    private var privatePiPPanel: NSWindow?
+    private var privatePiPPanelCloseObserver: NSObjectProtocol?
+    private var windowWillCloseObserver: NSObjectProtocol?
+    private var windowDidBecomeKeyObserver: NSObjectProtocol?
+    private var isObservingPrivatePiPPanel = false
+    private var privatePiPPanelKVOContext = 0
+    private var privatePiPPanelNilVerificationWorkItem: DispatchWorkItem?
     private var wantsStart = false
     private var isStartingPictureInPicture = false
     private var hasReceivedFrame = false
@@ -731,12 +748,22 @@ private final class NativePiPController: NSObject, AVPictureInPictureControllerD
         wantsStart = false
         isStartingPictureInPicture = false
         hasReceivedFrame = false
-        if let privatePiPController, privatePiPPresented {
-            privatePiPController.perform(NSSelectorFromString("dismissPictureInPictureWithCompletionHandler:"), with: nil)
-            privatePiPPresented = false
-            if pipDebugLoggingEnabled {
-                print("[Float PiP] private.stop requested=true")
+        if privatePiPPresented {
+            let shouldDismissPrivatePiP = shouldAttemptPrivateDismiss()
+            handlePrivatePiPStateDidChange(isPresented: false, reason: "stop-request", notifyExternalClose: false)
+            isStoppingPrivatePiPProgrammatically = true
+            if shouldDismissPrivatePiP, let privatePiPController {
+                if dismissPrivatePictureInPicture(on: privatePiPController) {
+                    if pipDebugLoggingEnabled {
+                        print("[Float PiP] private.stop requested=true")
+                    }
+                } else if pipDebugLoggingEnabled {
+                    print("[Float PiP] private.stop requested=false reason=missing-dismiss-selector")
+                }
+            } else if pipDebugLoggingEnabled {
+                print("[Float PiP] private.stop requested=false reason=tracked-window-not-visible")
             }
+            isStoppingPrivatePiPProgrammatically = false
         }
         pipController?.stopPictureInPicture()
         sampleBufferDisplayLayer.flush()
@@ -815,8 +842,8 @@ private final class NativePiPController: NSObject, AVPictureInPictureControllerD
 
         if let privatePiPController {
             guard !privatePiPPresented else { return }
-            let selector = NSSelectorFromString("presentViewControllerAsPictureInPicture:")
-            guard privatePiPController.responds(to: selector) else {
+            let selectorName = "presentViewControllerAsPictureInPicture:"
+            guard privatePiPController.responds(to: NSSelectorFromString(selectorName)) else {
                 if pipDebugLoggingEnabled {
                     print("[Float PiP] private.start unavailable reason=missing-selector")
                 }
@@ -827,8 +854,32 @@ private final class NativePiPController: NSObject, AVPictureInPictureControllerD
             if pipDebugLoggingEnabled {
                 print("[Float PiP] private.start possible=true")
             }
-            privatePiPController.perform(selector, with: privatePiPContentViewController)
-            privatePiPPresented = true
+            guard callObjectSetter(
+                on: privatePiPController,
+                selectorName: selectorName,
+                value: privatePiPContentViewController
+            ) else {
+                isStartingPictureInPicture = false
+                if pipDebugLoggingEnabled {
+                    print("[Float PiP] private.start failed reason=invoke-error")
+                }
+                return
+            }
+            handlePrivatePiPStateDidChange(isPresented: true, reason: "start", notifyExternalClose: false)
+            if pipDebugLoggingEnabled {
+                let panel = currentPrivatePiPPanel()
+                let panelClass = panel.map { NSStringFromClass(type(of: $0)) } ?? "nil"
+                print("[Float PiP] private.start post-present panel=\(panelClass)")
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(600)) { [weak self] in
+                guard let self else { return }
+                guard self.privatePiPPresented else { return }
+                if pipDebugLoggingEnabled {
+                    let panel = self.currentPrivatePiPPanel()
+                    let panelClass = panel.map { NSStringFromClass(type(of: $0)) } ?? "nil"
+                    print("[Float PiP] private.start delayed-panel panel=\(panelClass)")
+                }
+            }
             isStartingPictureInPicture = false
             return
         }
@@ -938,6 +989,322 @@ private final class NativePiPController: NSObject, AVPictureInPictureControllerD
         let imp = controller.method(for: selector)
         let fn = unsafeBitCast(imp, to: Setter.self)
         fn(controller, selector, value)
+    }
+
+    private func callObjectSetter(on controller: NSObject, selectorName: String, value: AnyObject?) -> Bool {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return false }
+        typealias Setter = @convention(c) (AnyObject, Selector, AnyObject?) -> Void
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Setter.self)
+        fn(controller, selector, value)
+        return true
+    }
+
+    private func callVoidMethod(on controller: NSObject, selectorName: String) -> Bool {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return false }
+        typealias Method = @convention(c) (AnyObject, Selector) -> Void
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Method.self)
+        fn(controller, selector)
+        return true
+    }
+
+    private func callObjectGetter(on controller: NSObject, selectorName: String) -> AnyObject? {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return nil }
+        typealias Getter = @convention(c) (AnyObject, Selector) -> AnyObject?
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Getter.self)
+        return fn(controller, selector)
+    }
+
+    private func dismissPrivatePictureInPicture(on controller: NSObject) -> Bool {
+        if callVoidMethod(on: controller, selectorName: "dismissPictureInPicture") {
+            return true
+        }
+        if callVoidMethod(on: controller, selectorName: "stopPictureInPicture") {
+            return true
+        }
+        if callObjectSetter(on: controller, selectorName: "dismissPictureInPictureWithCompletionHandler:", value: nil) {
+            return true
+        }
+        return false
+    }
+
+    private func handlePrivatePiPStateDidChange(isPresented: Bool, reason: String, notifyExternalClose: Bool) {
+        privatePiPPresented = isPresented
+        if isPresented {
+            cancelPrivatePiPPanelNilVerification(reason: "state-presented")
+            startPrivatePiPPanelObservation()
+            refreshPrivatePiPPanelFromController()
+        } else {
+            cancelPrivatePiPPanelNilVerification(reason: "state-not-presented")
+            stopPrivatePiPPanelObservation()
+            if notifyExternalClose {
+                onPictureInPictureClosed?()
+            }
+        }
+        if pipDebugLoggingEnabled {
+            let panelClass = privatePiPPanel.map { NSStringFromClass(type(of: $0)) } ?? "nil"
+            print(
+                "[Float PiP] private.state presented=\(isPresented) reason=\(reason) " +
+                "notifyExternalClose=\(notifyExternalClose) panel=\(panelClass) observing=\(isObservingPrivatePiPPanel)"
+            )
+        }
+    }
+
+    private func startPrivatePiPPanelObservation() {
+        guard let controller = privatePiPController else { return }
+        ensureGlobalWindowObservers()
+        if !isObservingPrivatePiPPanel {
+            controller.addObserver(self, forKeyPath: "panel", options: [.initial, .new], context: &privatePiPPanelKVOContext)
+            isObservingPrivatePiPPanel = true
+            if pipDebugLoggingEnabled {
+                print("[Float PiP] private.panel-observe start")
+            }
+        } else {
+            refreshPrivatePiPPanelFromController()
+        }
+    }
+
+    private func stopPrivatePiPPanelObservation() {
+        cancelPrivatePiPPanelNilVerification(reason: "stop-observation")
+        if isObservingPrivatePiPPanel, let controller = privatePiPController {
+            controller.removeObserver(self, forKeyPath: "panel", context: &privatePiPPanelKVOContext)
+            isObservingPrivatePiPPanel = false
+        }
+        detachPrivatePiPPanelCloseObserver()
+        detachGlobalWindowObservers()
+        privatePiPPanel = nil
+        if pipDebugLoggingEnabled {
+            print("[Float PiP] private.panel-observe stop")
+        }
+    }
+
+    private func detachPrivatePiPPanelCloseObserver() {
+        if let observer = privatePiPPanelCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            privatePiPPanelCloseObserver = nil
+        }
+    }
+
+    private func refreshPrivatePiPPanelFromController() {
+        let panel = currentPrivatePiPPanel()
+        if pipDebugLoggingEnabled {
+            let panelClass = panel.map { NSStringFromClass(type(of: $0)) } ?? "nil"
+            print("[Float PiP] private.panel refresh panel=\(panelClass)")
+        }
+        updateObservedPrivatePiPPanel(panel)
+    }
+
+    private func currentPrivatePiPPanel() -> NSWindow? {
+        guard let controller = privatePiPController else { return nil }
+        return callObjectGetter(on: controller, selectorName: "panel") as? NSWindow
+    }
+
+    private func updateObservedPrivatePiPPanel(_ panel: NSWindow?) {
+        if privatePiPPanel === panel { return }
+        detachPrivatePiPPanelCloseObserver()
+        privatePiPPanel = panel
+        guard let panel else {
+            if pipDebugLoggingEnabled {
+                print("[Float PiP] private.panel detached")
+            }
+            schedulePrivatePiPPanelNilVerification(reason: "panel-detached")
+            return
+        }
+        cancelPrivatePiPPanelNilVerification(reason: "panel-attached")
+        privatePiPPanelCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handlePrivatePiPPanelWillClose()
+            }
+        }
+        if pipDebugLoggingEnabled {
+            let title = panel.title.isEmpty ? "<empty>" : panel.title
+            print("[Float PiP] private.panel attached class=\(NSStringFromClass(type(of: panel))) title=\(title) visible=\(panel.isVisible)")
+        }
+    }
+
+    private func ensureGlobalWindowObservers() {
+        if windowWillCloseObserver == nil {
+            windowWillCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                self?.handleAnyWindowWillClose(notification)
+            }
+        }
+        if windowDidBecomeKeyObserver == nil {
+            windowDidBecomeKeyObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didBecomeKeyNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                self?.handleAnyWindowDidBecomeKey(notification)
+            }
+        }
+    }
+
+    private func detachGlobalWindowObservers() {
+        if let observer = windowWillCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            windowWillCloseObserver = nil
+        }
+        if let observer = windowDidBecomeKeyObserver {
+            NotificationCenter.default.removeObserver(observer)
+            windowDidBecomeKeyObserver = nil
+        }
+    }
+
+    private func handleAnyWindowDidBecomeKey(_ notification: Notification) {
+        guard privatePiPPresented else { return }
+        guard let window = notification.object as? NSWindow else { return }
+        let isMatch = isLikelyPrivatePiPWindow(window)
+        if pipDebugLoggingEnabled {
+            let title = window.title.isEmpty ? "<empty>" : window.title
+            print(
+                "[Float PiP] private.window didBecomeKey class=\(NSStringFromClass(type(of: window))) " +
+                "title=\(title) visible=\(window.isVisible) level=\(window.level.rawValue) match=\(isMatch)"
+            )
+        }
+        if isMatch {
+            updateObservedPrivatePiPPanel(window)
+            if pipDebugLoggingEnabled {
+                let className = NSStringFromClass(type(of: window))
+                print("[Float PiP] private.panel visible class=\(className)")
+            }
+        }
+    }
+
+    private func handleAnyWindowWillClose(_ notification: Notification) {
+        guard privatePiPPresented else { return }
+        guard let window = notification.object as? NSWindow else { return }
+        let isMatch = window === privatePiPPanel || isLikelyPrivatePiPWindow(window)
+        if pipDebugLoggingEnabled {
+            let title = window.title.isEmpty ? "<empty>" : window.title
+            let className = NSStringFromClass(type(of: window))
+            let trackedClass = privatePiPPanel.map { NSStringFromClass(type(of: $0)) } ?? "nil"
+            print(
+                "[Float PiP] private.window willClose class=\(className) title=\(title) " +
+                "visible=\(window.isVisible) match=\(isMatch) tracked=\(trackedClass)"
+            )
+        }
+        guard isMatch else { return }
+        handlePrivatePiPPanelWillClose()
+    }
+
+    private func isLikelyPrivatePiPWindow(_ window: NSWindow) -> Bool {
+        if window === privatePiPPanel { return true }
+        if window.contentViewController === privatePiPContentViewController { return true }
+        if privatePiPContentViewController.view.window === window { return true }
+        let className = NSStringFromClass(type(of: window)).lowercased()
+        if className.contains("pip") || className.contains("pictureinpicture") {
+            return true
+        }
+        return false
+    }
+
+    private func handlePrivatePiPPanelWillClose() {
+        cancelPrivatePiPPanelNilVerification(reason: "panel-will-close")
+        let isExternalClose = !isStoppingPrivatePiPProgrammatically
+        if pipDebugLoggingEnabled {
+            print("[Float PiP] private.panel willClose external=\(isExternalClose)")
+        }
+        guard privatePiPPresented else { return }
+        handlePrivatePiPStateDidChange(
+            isPresented: false,
+            reason: "panel-willClose",
+            notifyExternalClose: isExternalClose
+        )
+    }
+
+    private func schedulePrivatePiPPanelNilVerification(reason: String) {
+        guard privatePiPPresented else { return }
+        guard !isStoppingPrivatePiPProgrammatically else {
+            if pipDebugLoggingEnabled {
+                print("[Float PiP] private.panel nil-verify skip reason=programmatic-stop trigger=\(reason)")
+            }
+            return
+        }
+        cancelPrivatePiPPanelNilVerification(reason: "reschedule-\(reason)")
+        let delay: DispatchTimeInterval = .milliseconds(450)
+        let workItem = DispatchWorkItem { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.verifyPrivatePiPPanelAfterNilTransition(trigger: reason)
+            }
+        }
+        privatePiPPanelNilVerificationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        if pipDebugLoggingEnabled {
+            print("[Float PiP] private.panel nil-verify scheduled trigger=\(reason) delayMs=450")
+        }
+    }
+
+    private func cancelPrivatePiPPanelNilVerification(reason: String) {
+        guard let workItem = privatePiPPanelNilVerificationWorkItem else { return }
+        workItem.cancel()
+        privatePiPPanelNilVerificationWorkItem = nil
+        if pipDebugLoggingEnabled {
+            print("[Float PiP] private.panel nil-verify canceled reason=\(reason)")
+        }
+    }
+
+    private func verifyPrivatePiPPanelAfterNilTransition(trigger: String) {
+        privatePiPPanelNilVerificationWorkItem = nil
+        guard privatePiPPresented else {
+            if pipDebugLoggingEnabled {
+                print("[Float PiP] private.panel nil-verify ignored reason=not-presented trigger=\(trigger)")
+            }
+            return
+        }
+        guard !isStoppingPrivatePiPProgrammatically else {
+            if pipDebugLoggingEnabled {
+                print("[Float PiP] private.panel nil-verify ignored reason=programmatic-stop trigger=\(trigger)")
+            }
+            return
+        }
+        let panel = currentPrivatePiPPanel()
+        guard panel == nil else {
+            if pipDebugLoggingEnabled {
+                let className = panel.map { NSStringFromClass(type(of: $0)) } ?? "unknown"
+                print("[Float PiP] private.panel nil-verify recovered panel=\(className) trigger=\(trigger)")
+            }
+            updateObservedPrivatePiPPanel(panel)
+            return
+        }
+        if pipDebugLoggingEnabled {
+            print("[Float PiP] private.panel nil-verify confirmed trigger=\(trigger) action=close")
+        }
+        handlePrivatePiPPanelWillClose()
+    }
+
+    private func shouldAttemptPrivateDismiss() -> Bool {
+        guard privatePiPPresented else { return false }
+        if let panel = privatePiPPanel {
+            return panel.isVisible
+        }
+        return currentPrivatePiPPanel() != nil
+    }
+
+    override func observeValue(
+        forKeyPath keyPath: String?,
+        of object: Any?,
+        change: [NSKeyValueChangeKey: Any]?,
+        context: UnsafeMutableRawPointer?
+    ) {
+        guard context == &privatePiPPanelKVOContext else {
+            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+            return
+        }
+        guard keyPath == "panel" else { return }
+        refreshPrivatePiPPanelFromController()
     }
 
     func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
