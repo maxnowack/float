@@ -108,3 +108,19 @@
   - Result: `Done` (TypeScript compile succeeded).
 - Outcome:
   - Milestone 3 complete: extension WebRTC sender + companion signaling + native companion receiver compile and build successfully.
+
+2026-02-13 13:53 CET
+- Implemented: Milestone 4 native PiP integration (in progress).
+  - Replaced debug preview window path in `NativeWebRTCReceiver` with native macOS PiP pipeline:
+    - `RTCVideoTrack` -> `RTCVideoRenderer` bridge -> `CMSampleBuffer`.
+    - `AVSampleBufferDisplayLayer` content source.
+    - `AVPictureInPictureController` with sample-buffer playback delegate.
+  - Added stream lifecycle hooks so receiver stop tears down PiP and flushes rendered media.
+  - Added receiver->server streaming state callback and menu state/icon wiring (`pip.fill` when active).
+- Validated:
+  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived -clonedSourcePackagesDirPath /tmp/float-spm CODE_SIGNING_ALLOWED=NO build`
+  - Result: `BUILD SUCCEEDED`.
+- Remaining before Milestone 4 can be marked complete:
+  - Manual end-to-end runtime validation on YouTube.
+  - Fullscreen Spaces persistence validation.
+  - Follow-up cleanup for deprecated `AVSampleBufferDisplayLayer` APIs and non-CV frame fallback path.

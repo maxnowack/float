@@ -19,6 +19,8 @@ final class SignalingServer: ObservableObject {
     @Published private(set) var tabs: [TabState] = []
     @Published private(set) var lastError: String?
     @Published private(set) var lastHelloVersion: Int?
+    @Published private(set) var isStreaming = false
+    @Published private(set) var lastExtensionDebugLog: String?
 
     var hasDetectedVideos: Bool {
         tabs.contains { !$0.videos.isEmpty }
@@ -46,6 +48,11 @@ final class SignalingServer: ObservableObject {
                 self.sendToAnyClientEncodable(payload)
             }
         }
+        receiver.onStreamingChanged = { [weak self] isStreaming in
+            Task { @MainActor [weak self] in
+                self?.isStreaming = isStreaming
+            }
+        }
         start()
     }
 
@@ -61,6 +68,8 @@ final class SignalingServer: ObservableObject {
         switch serverState {
         case .error:
             return "exclamationmark.circle.fill"
+        case .connected where isStreaming:
+            return "pip.fill"
         case .connected where hasDetectedVideos:
             return "play.circle.fill"
         case .connected:
@@ -76,6 +85,8 @@ final class SignalingServer: ObservableObject {
             return "Starting"
         case .waiting:
             return "Waiting for extension"
+        case .connected where isStreaming:
+            return "Streaming in PiP"
         case .connected:
             return hasDetectedVideos ? "Videos detected" : "Connected"
         case .error(let message):
@@ -95,6 +106,7 @@ final class SignalingServer: ObservableObject {
 
     func requestStop() {
         webRTCReceiver.stop()
+        isStreaming = false
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])
     }
 
@@ -209,6 +221,7 @@ final class SignalingServer: ObservableObject {
             case FloatProtocol.MessageType.stop:
                 webRTCReceiver.stop()
                 Task { @MainActor in
+                    self.isStreaming = false
                     self.tabs = []
                 }
             case FloatProtocol.MessageType.offer:
@@ -226,6 +239,17 @@ final class SignalingServer: ObservableObject {
                 let reason = errorMessage.reason ?? "Received error from extension"
                 lastError = reason
                 log("Extension error: \(reason)")
+            case FloatProtocol.MessageType.debug:
+                let debugMessage = try decoder.decode(DebugMessage.self, from: data)
+                let source = debugMessage.source ?? "extension"
+                let event = debugMessage.event ?? "unknown-event"
+                let tab = debugMessage.tabId.map(String.init) ?? "n/a"
+                let frame = debugMessage.frameId.map(String.init) ?? "n/a"
+                let url = debugMessage.url ?? "n/a"
+                let payload = debugMessage.payload?.rawDescription ?? "null"
+                let line = "[\(source)] \(event) tab=\(tab) frame=\(frame) url=\(url) payload=\(payload)"
+                lastExtensionDebugLog = line
+                log("Extension debug: \(line)")
             default:
                 sendError("Unsupported message type: \(envelope.type)", to: clientID)
             }

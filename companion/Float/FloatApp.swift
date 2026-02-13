@@ -59,6 +59,19 @@ private struct MenuContentView: View {
             }
         }
 
+        if let debugLog = signalingServer.lastExtensionDebugLog {
+            Divider()
+            Text("Extension Debug")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(debugLog)
+                .font(.caption2)
+            Button("Copy Debug Log") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(debugLog, forType: .string)
+            }
+        }
+
         Divider()
 
         if let helloVersion = signalingServer.lastHelloVersion {

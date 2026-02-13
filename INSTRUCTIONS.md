@@ -98,7 +98,7 @@ Implement the Chromium extension in TypeScript (not plain JS). Keep it lightweig
 
   * `SignalingServer` (WebSocket)
   * `WebRTCReceiver` (receives track, converts frames to sample buffers)
-  * `PiPController` (native `AVPictureInPictureController`)
+  * `PiPController` (native macOS PiP panel via private `PIP.framework` with AVKit fallback)
   * `Pairing` (token)
 
 ---
@@ -198,17 +198,23 @@ Menu data source
 
 ### 4.4 “Native PiP” requirement
 
-Be precise: Apple’s **system PiP** (`AVPictureInPictureController`) is designed around `AVPlayerLayer` / `AVSampleBufferDisplayLayer`. WebRTC renderers don’t automatically fit.
+Use **true native macOS PiP**. Do not use a PiP-like custom floating window.
 
-For MVP, **use true native system PiP**. Do not use a PiP-like custom floating window.
+Current implementation target (MVP):
 
-Required implementation path:
-
-1. Host an `AVSampleBufferDisplayLayer` in the companion app.
+1. Host an `AVSampleBufferDisplayLayer` in a companion-side view controller.
 2. Feed it from the WebRTC frame bridge.
-3. Build `AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)`.
-4. Start/stop PiP via menu actions and stream lifecycle.
-5. On disconnect/error: stop PiP, flush layer, release receiver resources.
+3. Use private `PIP.framework` (`PIPViewController`) at runtime:
+   - `presentViewControllerAsPictureInPicture:`
+   - `dismissPictureInPictureWithCompletionHandler:`
+4. Apply aspect-ratio lock with private setters (`setAspectRatio`, `setMinSize`/`setMaxSize`).
+5. Keep `AVPictureInPictureController` (`sampleBufferDisplayLayer` content source) as fallback when private API is unavailable.
+6. On disconnect/error: stop PiP, flush layer, release receiver resources.
+
+Notes:
+
+* This private-framework approach is for local development/use and may not be suitable for App Store distribution.
+* If Apple provides stable entitlement-backed APIs for this path in the future, migrate to those.
 
 ### 4.5 Video selection UI
 
@@ -365,7 +371,7 @@ MVP workaround:
 1. Companion: WS server + menu bar UI that can display received state.
 2. Extension: detect videos and send `state` over WS.
 3. WebRTC minimal: extension creates peer connection and sends a test video track; companion renders it.
-4. Integrate native PiP (`AVPictureInPictureController`) backed by `AVSampleBufferDisplayLayer`.
+4. Integrate native PiP (`PIP.framework` primary, `AVPictureInPictureController` fallback) backed by `AVSampleBufferDisplayLayer`.
 5. Multi-tab / multi-video selection.
 6. Allowlist + pairing.
 
@@ -463,6 +469,8 @@ Project name: **Float**
 * Per-site profiles (size, position, volume).
 * Hotkey to toggle PiP and cycle videos.
 * Remember last selected tab/video.
+* Migrate deprecated `AVSampleBufferDisplayLayer` queue/flush calls to the modern sample-buffer renderer API.
+* Evaluate replacing private PiP framework usage with public/entitlement-backed APIs when available.
 
 
 # Operating principles

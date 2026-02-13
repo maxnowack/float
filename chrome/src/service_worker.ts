@@ -191,6 +191,31 @@ function onErrorFromContent(message: any, sender: any): void {
   });
 }
 
+function onDebugFromContent(message: any, sender: any): void {
+  const tabId = sender?.tab?.id;
+  const source = typeof message.source === "string" ? message.source : "content-script";
+  const event = typeof message.event === "string" ? message.event : "unknown-event";
+  const payload = message.payload ?? null;
+  const url = typeof message.url === "string" ? message.url : sender?.url ?? null;
+
+  sendSocketMessage({
+    type: FloatProtocol.messageType.debug,
+    source,
+    event,
+    tabId: typeof tabId === "number" ? tabId : -1,
+    frameId: typeof sender?.frameId === "number" ? sender.frameId : null,
+    url,
+    payload,
+  });
+
+  console.log(`[Float SW][${source}] ${event}`, {
+    tabId: typeof tabId === "number" ? tabId : null,
+    frameId: typeof sender?.frameId === "number" ? sender.frameId : null,
+    url,
+    payload,
+  });
+}
+
 function frameKey(sender: any): string {
   const frameId = sender && typeof sender.frameId === "number" ? sender.frameId : 0;
   return String(frameId);
@@ -349,6 +374,11 @@ chrome.runtime.onMessage.addListener((message: any, sender: any) => {
     sendSocketMessage({
       type: FloatProtocol.messageType.stop,
     });
+    return;
+  }
+
+  if (message.type === "float:debug") {
+    onDebugFromContent(message, sender);
   }
 });
 

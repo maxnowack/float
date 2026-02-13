@@ -10,6 +10,7 @@ struct LocalIceCandidate {
 
 protocol WebRTCReceiver {
     var onLocalIceCandidate: ((LocalIceCandidate) -> Void)? { get set }
+    var onStreamingChanged: ((Bool) -> Void)? { get set }
     func handleOffer(_ offer: OfferMessage) async throws -> String
     func addRemoteIceCandidate(_ ice: IceMessage) async throws
     func stop()
@@ -34,6 +35,7 @@ enum WebRTCReceiverError: LocalizedError {
 
 final class StubWebRTCReceiver: WebRTCReceiver {
     var onLocalIceCandidate: ((LocalIceCandidate) -> Void)?
+    var onStreamingChanged: ((Bool) -> Void)?
 
     func handleOffer(_ offer: OfferMessage) async throws -> String {
         _ = offer
@@ -45,7 +47,9 @@ final class StubWebRTCReceiver: WebRTCReceiver {
         throw WebRTCReceiverError.notConfigured
     }
 
-    func stop() {}
+    func stop() {
+        onStreamingChanged?(false)
+    }
 }
 
 func makeWebRTCReceiver() -> WebRTCReceiver {

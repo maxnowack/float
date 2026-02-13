@@ -12,6 +12,7 @@ if (!globalScope.FloatProtocol) {
       ice: "ice",
       stop: "stop",
       error: "error",
+      debug: "debug",
     },
   };
 }
