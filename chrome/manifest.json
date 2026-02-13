@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Float",
+  "version": "0.1.0",
+  "description": "Detects playing videos and coordinates with the Float macOS companion.",
+  "permissions": [
+    "storage",
+    "tabs"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "dist/service_worker.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "dist/protocol.js",
+        "dist/content_script.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Float"
+  }
+}

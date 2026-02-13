@@ -1,0 +1,42 @@
+# Chrome
+node_modules
+chrome/dist
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Xcode
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+*.xccheckout
+*.xcscmblueprint
+*.moved-aside
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Build artifacts
+.build/
+.xcodebuild*/
+
+# CocoaPods (if ever used)
+Pods/
+
+# Code signing
+*.p12
+*.mobileprovision
+*.provisionprofile
+
+# App archives
+*.xcarchive
+
+# Distribution
+*.app
+*.dmg
+*.zip

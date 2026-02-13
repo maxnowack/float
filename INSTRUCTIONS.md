@@ -45,7 +45,7 @@ Float consists of 3 cooperating pieces:
 
 1. **Extension UI + background** (MV3 service worker)
 2. **Content script + page script** (runs on allowed sites to detect and capture the playing `<video>`)
-3. **Companion macOS app** (menu bar + native PiP window + WebRTC receiver)
+3. **Companion macOS app** (menu bar + native macOS PiP + WebRTC receiver)
 
 ### Core technical approach
 
@@ -60,7 +60,7 @@ Float consists of 3 cooperating pieces:
 
 Rationale:
 
-* An extension cannot make Chromium’s PiP window float above fullscreen Spaces. A native window can.
+* An extension cannot keep Chromium PiP reliably above fullscreen Spaces. Native macOS PiP can.
 * Streaming the already-playing element means any skips/seeks (SponsorBlock, user seeking) are reflected.
 
 ---
@@ -97,8 +97,8 @@ Implement the Chromium extension in TypeScript (not plain JS). Keep it lightweig
 * Modules:
 
   * `SignalingServer` (WebSocket)
-  * `WebRTCReceiver` (receives track, renders)
-  * `PiPWindowController` (native always-on-top window)
+  * `WebRTCReceiver` (receives track, converts frames to sample buffers)
+  * `PiPController` (native `AVPictureInPictureController`)
   * `Pairing` (token)
 
 ---
@@ -181,15 +181,17 @@ Menu data source
 * `stop` — either direction
 * `error` — either direction
 
-### 4.3 WebRTC receiver
+### 4.3 WebRTC receiver + frame bridge
 
 * Use Google WebRTC native framework for macOS.
 
   * Add via Swift Package Manager if available, or via prebuilt framework.
 * Create `RTCPeerConnection` configured for localhost.
 * On receiving a video track:
-
-  * Render into a view using `RTCMTLVideoView` (Metal) for performance.
+  * Implement an `RTCVideoRenderer` bridge that receives `RTCVideoFrame`.
+  * Convert `RTCVideoFrame` to `CVPixelBuffer`.
+  * Wrap each frame in `CMSampleBuffer` using monotonic timestamps.
+  * Enqueue to `AVSampleBufferDisplayLayer`.
 * On receiving audio:
 
   * play via WebRTC audio engine.
@@ -198,25 +200,15 @@ Menu data source
 
 Be precise: Apple’s **system PiP** (`AVPictureInPictureController`) is designed around `AVPlayerLayer` / `AVSampleBufferDisplayLayer`. WebRTC renderers don’t automatically fit.
 
-For an MVP that satisfies the user’s requirement (“visible across fullscreen Spaces”), implement a **native always-on-top panel** that behaves like PiP:
+For MVP, **use true native system PiP**. Do not use a PiP-like custom floating window.
 
-* Use `NSPanel` or borderless `NSWindow`.
-* Set:
+Required implementation path:
 
-  * `level = .floating` (or `.statusBar` if needed)
-  * `collectionBehavior` includes:
-
-    * `.canJoinAllSpaces`
-    * `.fullScreenAuxiliary`
-    * `.stationary`
-  * `isMovableByWindowBackground = true`
-  * rounded corners, shadow
-
-This yields the *behavioral* PiP requirement (stays visible across fullscreen apps).
-
-Optional later: true system PiP
-
-* To integrate `AVPictureInPictureController`, convert WebRTC frames into `CMSampleBuffer` and enqueue into `AVSampleBufferDisplayLayer`, then wrap with PiP controller. This is significantly more work; postpone until MVP is stable.
+1. Host an `AVSampleBufferDisplayLayer` in the companion app.
+2. Feed it from the WebRTC frame bridge.
+3. Build `AVPictureInPictureController.ContentSource(sampleBufferDisplayLayer:playbackDelegate:)`.
+4. Start/stop PiP via menu actions and stream lifecycle.
+5. On disconnect/error: stop PiP, flush layer, release receiver resources.
 
 ### 4.5 Video selection UI
 
@@ -355,8 +347,8 @@ MVP workaround:
 ### Acceptance tests
 
 1. Open YouTube video, confirm companion icon shows “available”.
-2. Select video; PiP window appears and plays.
-3. Enter fullscreen VS Code; PiP stays visible and keeps playing.
+2. Select video; native macOS PiP starts and plays.
+3. Enter fullscreen VS Code; native PiP stays visible and keeps playing.
 4. SponsorBlock causes a skip; PiP playback reflects the jump.
 5. Switch to another video in same tab; state updates.
 6. Stop streaming; resources released.
@@ -373,7 +365,7 @@ MVP workaround:
 1. Companion: WS server + menu bar UI that can display received state.
 2. Extension: detect videos and send `state` over WS.
 3. WebRTC minimal: extension creates peer connection and sends a test video track; companion renders it.
-4. Wrap in PiP-like always-on-top panel with proper Spaces behavior.
+4. Integrate native PiP (`AVPictureInPictureController`) backed by `AVSampleBufferDisplayLayer`.
 5. Multi-tab / multi-video selection.
 6. Allowlist + pairing.
 
@@ -450,7 +442,7 @@ When DRM is detected **or** when capture/stream fails with a DRM-like symptom (e
 * [ ] WebRTC sender in page context
 * [ ] macOS WS server + pairing
 * [ ] macOS WebRTC receiver + renderer
-* [ ] PiP-like window across Spaces
+* [ ] Native macOS PiP integration (`AVPictureInPictureController` + `AVSampleBufferDisplayLayer`)
 * [ ] Basic QA script / manual test steps
 
 ---
@@ -467,7 +459,7 @@ Project name: **Float**
 
 ## 12) Notes for future improvements
 
-* True system PiP via `AVPictureInPictureController` + `AVSampleBufferDisplayLayer` fed from WebRTC frames.
+* Improve frame pacing/jitter buffering for the PiP frame bridge.
 * Per-site profiles (size, position, volume).
 * Hotkey to toggle PiP and cycle videos.
 * Remember last selected tab/video.
@@ -685,7 +677,7 @@ J) Done criteria for MVP
 
 MVP is considered complete only when:
 	•	All acceptance tests in the main spec pass,
-	•	The PiP-like window stays visible across fullscreen Spaces,
+	•	Native macOS PiP stays visible across fullscreen Spaces,
 	•	State updates reflect YouTube navigation changes,
 	•	Stop/cleanup is reliable,
 	•	AGENT_PLAN.md and AGENT_STATUS.md are up to date and readable.

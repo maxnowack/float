@@ -1,24 +1,8 @@
-//
-//  ContentView.swift
-//  Float
-//
-//  Created by Max Nowack on 13.02.26.
-//
-
 import SwiftUI
 
 struct ContentView: View {
     var body: some View {
-        VStack {
-            Image(systemName: "globe")
-                .imageScale(.large)
-                .foregroundStyle(.tint)
-            Text("Hello, world!")
-        }
-        .padding()
+        Text("Float")
+            .padding()
     }
-}
-
-#Preview {
-    ContentView()
 }
