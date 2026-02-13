@@ -22,14 +22,43 @@ final class SignalingServer: ObservableObject {
     @Published private(set) var isStreaming = false
     @Published private(set) var lastExtensionDebugLog: String?
 
+    struct VideoSource: Identifiable {
+        let tabId: Int
+        let videoId: String
+        let tabTitle: String
+        let domain: String
+        let resolution: String?
+
+        var id: String { "\(tabId):\(videoId)" }
+        var displayTitle: String {
+            "\(tabTitle) (\(domain))"
+        }
+    }
+
     var hasDetectedVideos: Bool {
         tabs.contains { !$0.videos.isEmpty }
+    }
+
+    var availableSources: [VideoSource] {
+        tabs.flatMap { tab in
+            tab.videos.map { video in
+                VideoSource(
+                    tabId: tab.tabId,
+                    videoId: video.videoId,
+                    tabTitle: tab.title,
+                    domain: tab.domain,
+                    resolution: video.resolution
+                )
+            }
+        }
     }
 
     private var listener: NWListener?
     private var clients: [UUID: WebSocketClient] = [:]
     private let queue = DispatchQueue(label: "com.float.signaling")
     private let webRTCReceiver: WebRTCReceiver
+    private var activeTabId: Int?
+    private var activeVideoId: String?
 
     init() {
         var receiver = makeWebRTCReceiver()
@@ -54,6 +83,10 @@ final class SignalingServer: ObservableObject {
                     print("[Float Signal] receiver.onStreamingChanged value=\(isStreaming)")
                 }
                 self?.isStreaming = isStreaming
+                if !isStreaming {
+                    self?.activeTabId = nil
+                    self?.activeVideoId = nil
+                }
             }
         }
         start()
@@ -68,17 +101,24 @@ final class SignalingServer: ObservableObject {
     }
 
     func iconName() -> String {
-        switch serverState {
-        case .error:
+        let sourceCount = availableSources.count
+        switch (serverState, sourceCount, isStreaming) {
+        case (.error, _, _):
             return "exclamationmark.circle.fill"
-        case .connected where isStreaming:
+        case (_, 0, true):
             return "pip.fill"
-        case .connected where hasDetectedVideos:
-            return "play.circle.fill"
-        case .connected:
-            return "dot.radiowaves.left.and.right"
-        case .starting, .waiting:
-            return "circle"
+        case (_, 0, false):
+            return "pip.slash"
+        case (_, 1, true):
+            return "pip.fill"
+        case (_, 1, false):
+            return "pip"
+        case (_, let count, true) where count > 1:
+            return "square.stack.3d.up.fill"
+        case (_, let count, false) where count > 1:
+            return "square.stack.3d.up"
+        default:
+            return "pip"
         }
     }
 
@@ -98,6 +138,8 @@ final class SignalingServer: ObservableObject {
     }
 
     func requestStart(tabId: Int, videoId: String) {
+        activeTabId = tabId
+        activeVideoId = videoId
         let payload: [String: Any] = [
             "type": FloatProtocol.MessageType.start,
             "tabId": tabId,
@@ -113,7 +155,13 @@ final class SignalingServer: ObservableObject {
         }
         webRTCReceiver.stop()
         isStreaming = false
+        activeTabId = nil
+        activeVideoId = nil
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])
+    }
+
+    func isActiveSource(_ source: VideoSource) -> Bool {
+        source.tabId == activeTabId && source.videoId == activeVideoId
     }
 
     private func start() {
@@ -228,6 +276,8 @@ final class SignalingServer: ObservableObject {
                 webRTCReceiver.stop()
                 Task { @MainActor in
                     self.isStreaming = false
+                    self.activeTabId = nil
+                    self.activeVideoId = nil
                     self.tabs = []
                 }
             case FloatProtocol.MessageType.offer:

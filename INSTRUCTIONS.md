@@ -22,8 +22,12 @@ This document tells an AI agent how to implement the product end-to-end.
 * Preserves in-browser behavior such as SponsorBlock skips (i.e., the popped-out playback must reflect seeks/skips performed by the webpage).
 * Menu bar app UX:
 
-  * Menu bar icon indicates whether at least one eligible video is detected.
-  * Clicking icon shows a list of candidate videos (tab title + domain + maybe video title) and allows selecting one to pop out.
+  * Menu bar icon indicates whether **0**, **1**, or **multiple** eligible video sources are available.
+  * Left click:
+    * if exactly one source is available, start PiP immediately.
+    * if multiple sources are available, show a source-only selection menu.
+  * Right click: show a quit-only context menu.
+  * App runs as menu bar only (no Dock icon).
 
 ### Nice-to-have
 
@@ -112,58 +116,33 @@ Float is primarily a **menu bar app**.
 Status item behavior
 
 * Create an `NSStatusItem` with a template icon.
-* The icon must communicate state at a glance (your requirement: icon changes when a video is detected):
-
-  * **Idle**: no eligible videos detected anywhere → neutral/monochrome.
-  * **Detected**: at least one eligible video detected → visually distinct (e.g., filled variant or badge dot).
-  * **Streaming**: actively receiving a stream → distinct active state (badge/alternate symbol).
-  * **Error**: pairing missing / extension disconnected / stream failure → warning badge and an explanatory menu item.
-
-> Prefer swapping the icon asset (idle/detected/streaming) rather than relying on tinting, which can be inconsistent for status items across appearances.
+* Run as menu-bar-only app (hide Dock icon; no normal app window).
+* The icon must communicate source availability at a glance:
+  * **0 sources**: “no video available” icon variant.
+  * **1 source**: “single video available” icon variant.
+  * **2+ sources**: “multiple videos available” icon variant.
+  * **Error**: explicit warning icon variant.
+* Prefer icon swaps over tint-only state cues.
 
 Click / menu contents
 
-Clicking the menu bar icon opens a menu that:
+Primary click (left click):
 
-1. **Available videos**
+* If PiP is currently active, stop floating immediately.
+* If exactly **1 source** is available, start PiP immediately (no menu).
+* If **2+ sources** are available, open a menu that contains **only** the available sources.
+  * Each item must include tab title and domain.
+  * Clicking an item starts PiP for that `videoId`.
+* If **0 sources** are available, no source menu is shown.
 
-* If **one** video is detected, show a primary action:
+Secondary click (right click):
 
-  * `Float “<Tab Title>”` (or best-effort video title)
-* If **multiple** videos are detected, show a selectable list. Each item must include:
-
-  * **Tab title** (required)
-  * **Domain** (required)
-  * Optional: best-effort **video title/channel**
-  * Optional: state markers (Playing/Paused, Muted, Resolution)
-* Selecting an item immediately starts floating that specific `videoId`.
-
-2. **When streaming**
-
-* `Stop Floating`
-* Optional: `Mute/Unmute`
-* Optional: size presets (Small/Medium/Large)
-
-3. **Site allow/deny controls** (your requirement: user decides which sites to allow)
-
-* `Allowed Sites…` (opens settings UI / extension options)
-* Optional quick actions for the currently selected tab’s domain:
-
-  * `Allow <domain>` / `Block <domain>`
-
-4. **Pairing / status**
-
-* If not paired: `Pair Extension…` (shows pairing code/QR)
-* If paired but extension not connected: show `Waiting for extension…`
-
-5. **Help / debug (optional)**
-
-* `Copy diagnostics` (local-only)
+* Show a minimal context menu with exactly one action: `Quit Float`.
 
 Menu data source
 
 * The extension pushes a `state` payload over WebSocket describing all detected candidates.
-* The companion keeps an in-memory model of candidates and rebuilds the menu on updates.
+* The companion keeps an in-memory model of candidates and uses it for icon state + left-click selection behavior.
 
 4.2 WebSocket signaling server
 
