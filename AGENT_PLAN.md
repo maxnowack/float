@@ -1,12 +1,12 @@
 # AGENT_PLAN
 
 ## Goal & current phase
-Build Float MVP incrementally. Milestones 1 and 2 are complete (companion WS/menu + extension detection/state bridge). Current phase is Milestone 3: minimal WebRTC sender/receiver path between extension and companion.
+Build Float MVP incrementally. Milestones 1, 2, and 3 are complete. Current phase is Milestone 4 (true native macOS PiP via `AVPictureInPictureController`).
 
 ## Milestones
 - [x] 1. Companion: WS server + menu bar UI that can display received state.
 - [x] 2. Extension: detect videos and send `state` over WS.
-- [ ] 3. WebRTC minimal: extension sends track; companion renders it.
+- [x] 3. WebRTC minimal: extension sends track; companion renders it.
 - [ ] 4. True native macOS PiP via `AVPictureInPictureController`.
 - [ ] 5. Multi-tab / multi-video selection.
 - [ ] 6. Allowlist + pairing.
@@ -15,56 +15,55 @@ Build Float MVP incrementally. Milestones 1 and 2 are complete (companion WS/men
 - Files touched in this phase:
   - `AGENT_PLAN.md`
   - `AGENT_STATUS.md`
-  - `chrome/manifest.json`
-  - `chrome/package.json`
-  - `chrome/yarn.lock`
-  - `chrome/tsconfig.json`
+  - `INSTRUCTIONS.md`
+  - `chrome/src/content_script.ts`
   - `chrome/src/globals.d.ts`
   - `chrome/src/protocol.ts`
-  - `chrome/src/content_script.ts`
   - `chrome/src/service_worker.ts`
   - `chrome/dist/*`
+  - `companion/Float/FloatApp.swift`
+  - `companion/Float/Protocol.swift`
+  - `companion/Float/SignalingServer.swift`
+  - `companion/Float/WebRTCReceiver.swift`
+  - `companion/Float/NativeWebRTCReceiver.swift`
+  - `companion/Float.xcodeproj/project.pbxproj`
+  - `companion/Float.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
 - Commands used to build/run/test:
-  - `yarn install` (in `chrome/`)
   - `yarn build` (in `chrome/`)
-  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived CODE_SIGNING_ALLOWED=NO build`
+  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived -clonedSourcePackagesDirPath /tmp/float-spm CODE_SIGNING_ALLOWED=NO build`
 
 ## Risks & unknowns
-- Content script currently injects on `<all_urls>`; allowlist control is not implemented yet.
-  - How we'll validate: implement options-based allowlist in Milestone 6 and verify skipped injection on blocked domains.
-- WS reconnect behavior is implemented but not manually chaos-tested with frequent companion restarts.
-  - How we'll validate: restart companion repeatedly while videos are playing and verify state reappears.
-- Start/stop messages are routed but WebRTC capture path is not wired, so menu actions do not yet start playback.
-  - How we'll validate: complete Milestone 3 and verify start initiates track flow.
+- Native PiP requirement depends on frame conversion path quality (`RTCVideoFrame -> CMSampleBuffer`).
+  - How we'll validate: verify smooth native PiP playback and A/V sync on YouTube for >= 10 minutes.
+- Extension currently injects on `<all_urls>`; allowlist is still not implemented.
+  - How we'll validate: implement options allowlist and verify injection blocked on disallowed domains.
 
 ## Next actions
-- Add extension-side WebRTC offer flow in page context for selected `videoId`.
-- Add companion-side `offer`/`answer`/`ice` handling in signaling server and receiver scaffolding.
-- Implement frame bridge from WebRTC video output to `AVSampleBufferDisplayLayer` and drive `AVPictureInPictureController`.
-- Introduce protocol-level parse validation for all signaling messages beyond `hello/state/start/stop`.
-- Add debug logs for WS traffic on extension side behind a flag.
-- Run manual integration check: companion running + extension loaded unpacked + YouTube state visible in menu.
+- Implement video frame bridge to `AVSampleBufferDisplayLayer` for native PiP integration.
+- Implement native PiP controller lifecycle (`AVPictureInPictureController`) bound to stream lifecycle.
+- Run end-to-end test: menu start action -> media appears in native PiP.
 
 ## Decision log
 - 2026-02-13 11:55 CET: use fixed localhost WebSocket port `17891` for MVP to simplify extension-side connection.
-- 2026-02-13 11:55 CET: use a lightweight in-process WS server via `Network.framework` with explicit frame parsing for Milestone 1.
-- 2026-02-13 11:55 CET: convert companion shell to `MenuBarExtra` to match menu-bar-first product UX.
+- 2026-02-13 11:55 CET: use `Network.framework` native WebSocket listener in companion.
 - 2026-02-13 12:00 CET: keep extension scripts in script-mode TypeScript (`module: none`) and share constants via `chrome/src/protocol.ts` loaded globally.
-- 2026-02-13 12:39 CET: Milestone 4 requirement updated by user: do not ship PiP-like custom window; ship true native macOS PiP only.
+- 2026-02-13 12:39 CET: Milestone 4 requirement updated by user: no PiP-like window; true native macOS PiP only.
+- 2026-02-13 13:14 CET: added conditional native receiver implementation (`#if canImport(WebRTC)`) and factory auto-selection.
+- 2026-02-13 13:47 CET: linked `alexpiezo/WebRTC` Swift package to companion target; native receiver now compiles and Milestone 3 is complete.
 
 ## Validation
-- Milestone 1:
-  - Ran `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived CODE_SIGNING_ALLOWED=NO build`.
+- Companion builds:
+  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived -clonedSourcePackagesDirPath /tmp/float-spm CODE_SIGNING_ALLOWED=NO build`
   - Outcome: `BUILD SUCCEEDED`.
-  - Note: `CODE_SIGNING_ALLOWED=NO` is required in this environment because signing assets are unavailable.
-- Milestone 2:
-  - Ran `yarn install` in `chrome/`.
-  - Ran `yarn build` in `chrome/`.
-  - Outcome: TypeScript build succeeded and emitted `chrome/dist` scripts for MV3.
+- Extension builds:
+  - `yarn build` in `chrome/`
+  - Outcome: TypeScript build succeeded and emitted `chrome/dist` scripts.
 
 ## Manual acceptance steps
 - [ ] Open YouTube video and confirm companion icon shows available state.
-- [ ] Select video and confirm float action sends `start` request.
+- [ ] Select video and confirm WebRTC stream renders in companion (current debug render surface).
+- [ ] Milestone 4: confirm native macOS PiP starts and plays.
+- [ ] Milestone 4: enter fullscreen VS Code and confirm native PiP remains visible.
 - [ ] Confirm app indicates waiting/connected/error states in menu.
 
 ## Known pitfalls regression checklist

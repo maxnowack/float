@@ -61,3 +61,50 @@
 - Updated product instructions to require true native macOS PiP (no PiP-like floating window fallback).
   - Revised architecture/modules to use `AVPictureInPictureController` + `AVSampleBufferDisplayLayer`.
   - Updated implementation order, acceptance tests, deliverables, and done criteria to native PiP wording.
+
+2026-02-13 12:44 CET
+- Implemented: Milestone 3 signaling plumbing on companion side.
+  - Added message models for `answer` and outbound ICE payloads.
+  - Added `WebRTCReceiver` abstraction and `StubWebRTCReceiver` placeholder backend.
+  - Companion `SignalingServer` now handles incoming `offer` and `ice`, routes to receiver, and sends `answer`/local `ice` back over WS.
+  - `stop` now tears down receiver state via `webRTCReceiver.stop()`.
+- Validated:
+  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived CODE_SIGNING_ALLOWED=NO build`
+  - Result: `BUILD SUCCEEDED`.
+- Remaining for milestone completion:
+  - Replace stub receiver with real native WebRTC backend and verify successful `offer/answer/ice` exchange with media rendering path.
+
+2026-02-13 12:48 CET
+- Implemented: receiver factory wiring and clearer backend dependency messaging.
+  - `SignalingServer` now constructs receiver through `makeWebRTCReceiver()`.
+  - Offer failure message now includes `videoId` context.
+  - Verified current environment lacks importable `WebRTC` module (`no-webrtc`), so stub backend remains active.
+- Validated:
+  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived CODE_SIGNING_ALLOWED=NO build`
+  - Result: `BUILD SUCCEEDED`.
+
+2026-02-13 13:15 CET
+- Continued Milestone 3 with conditional native receiver scaffold.
+  - Added `NativeWebRTCReceiver` behind `#if canImport(WebRTC)` and factory auto-selection in `makeWebRTCReceiver()`.
+  - Kept current behavior safe with stub receiver fallback when WebRTC dependency is unavailable.
+- Validated:
+  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived CODE_SIGNING_ALLOWED=NO build` -> `BUILD SUCCEEDED`.
+  - `canImport(WebRTC)` probe -> `no-webrtc`.
+- Blocker:
+  - Need to link native WebRTC framework/package into companion target before real receive path can run.
+
+2026-02-13 13:47 CET
+- Implemented: Milestone 3 completion work.
+  - Linked native WebRTC package dependency into companion target (`alexpiezo/WebRTC`).
+  - Added package resolution lockfile at `companion/Float.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`.
+  - Fixed `NativeWebRTCReceiver` to match package APIs:
+    - remote ICE add now uses `try await`.
+    - explicit typed throwing continuations for SDP set calls.
+    - removed unavailable `RTCMTLNSVideoView.videoContentMode`.
+- Validated:
+  - `xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -derivedDataPath /tmp/float-derived -clonedSourcePackagesDirPath /tmp/float-spm CODE_SIGNING_ALLOWED=NO build`
+  - Result: `BUILD SUCCEEDED`.
+  - `yarn build` in `chrome/`
+  - Result: `Done` (TypeScript compile succeeded).
+- Outcome:
+  - Milestone 3 complete: extension WebRTC sender + companion signaling + native companion receiver compile and build successfully.

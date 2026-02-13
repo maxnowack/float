@@ -27,8 +27,25 @@ final class SignalingServer: ObservableObject {
     private var listener: NWListener?
     private var clients: [UUID: WebSocketClient] = [:]
     private let queue = DispatchQueue(label: "com.float.signaling")
+    private let webRTCReceiver: WebRTCReceiver
 
     init() {
+        var receiver = makeWebRTCReceiver()
+        self.webRTCReceiver = receiver
+        receiver.onLocalIceCandidate = { [weak self] candidate in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                let payload = OutgoingIceMessage(
+                    type: FloatProtocol.MessageType.ice,
+                    tabId: candidate.tabId,
+                    videoId: candidate.videoId,
+                    candidate: candidate.candidate,
+                    sdpMid: candidate.sdpMid,
+                    sdpMLineIndex: candidate.sdpMLineIndex
+                )
+                self.sendToAnyClientEncodable(payload)
+            }
+        }
         start()
     }
 
@@ -77,6 +94,7 @@ final class SignalingServer: ObservableObject {
     }
 
     func requestStop() {
+        webRTCReceiver.stop()
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])
     }
 
@@ -189,8 +207,19 @@ final class SignalingServer: ObservableObject {
                     self.tabs = state.tabs
                 }
             case FloatProtocol.MessageType.stop:
+                webRTCReceiver.stop()
                 Task { @MainActor in
                     self.tabs = []
+                }
+            case FloatProtocol.MessageType.offer:
+                let offer = try decoder.decode(OfferMessage.self, from: data)
+                Task { @MainActor in
+                    await self.handleOffer(offer, clientID: clientID)
+                }
+            case FloatProtocol.MessageType.ice:
+                let ice = try decoder.decode(IceMessage.self, from: data)
+                Task { @MainActor in
+                    await self.handleIce(ice, clientID: clientID)
                 }
             case FloatProtocol.MessageType.error:
                 let errorMessage = try decoder.decode(ErrorMessage.self, from: data)
@@ -237,6 +266,52 @@ final class SignalingServer: ObservableObject {
             "type": FloatProtocol.MessageType.error,
             "reason": message,
         ])
+    }
+
+    private func handleOffer(_ offer: OfferMessage, clientID: UUID) async {
+        do {
+            let answerSDP = try await webRTCReceiver.handleOffer(offer)
+            let answer = AnswerMessage(
+                type: FloatProtocol.MessageType.answer,
+                tabId: offer.tabId,
+                videoId: offer.videoId,
+                sdp: answerSDP
+            )
+            sendEncodable(answer, to: clientID)
+        } catch {
+            sendError("Failed to process offer for \(offer.videoId): \(error.localizedDescription)", to: clientID)
+        }
+    }
+
+    private func handleIce(_ ice: IceMessage, clientID: UUID) async {
+        do {
+            try await webRTCReceiver.addRemoteIceCandidate(ice)
+        } catch {
+            sendError("Failed to add ICE candidate: \(error.localizedDescription)", to: clientID)
+        }
+    }
+
+    private func sendEncodable<T: Encodable>(_ value: T, to clientID: UUID) {
+        do {
+            let data = try JSONEncoder().encode(value)
+            guard
+                let raw = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+            else {
+                sendError("Failed to serialize encoded payload", to: clientID)
+                return
+            }
+            sendToClient(clientID, payload: raw)
+        } catch {
+            sendError("Failed to encode payload: \(error.localizedDescription)", to: clientID)
+        }
+    }
+
+    private func sendToAnyClientEncodable<T: Encodable>(_ value: T) {
+        guard let clientID = clients.keys.first else {
+            lastError = "No extension connection available"
+            return
+        }
+        sendEncodable(value, to: clientID)
     }
 
     private func log(_ message: String) {

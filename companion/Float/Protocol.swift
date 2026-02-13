@@ -32,7 +32,23 @@ struct OfferMessage: Decodable {
     let sdp: String
 }
 
+struct AnswerMessage: Encodable {
+    let type: String
+    let tabId: Int
+    let videoId: String
+    let sdp: String
+}
+
 struct IceMessage: Decodable {
+    let type: String
+    let tabId: Int
+    let videoId: String
+    let candidate: String
+    let sdpMid: String?
+    let sdpMLineIndex: Int?
+}
+
+struct OutgoingIceMessage: Encodable {
     let type: String
     let tabId: Int
     let videoId: String
