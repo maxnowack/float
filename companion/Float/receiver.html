@@ -1,0 +1,323 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<style>
+  html, body {
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    height: 100%;
+    background: black;
+    overflow: hidden;
+  }
+  #surface {
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    background: black;
+  }
+  #player {
+    position: fixed;
+    width: 1px;
+    height: 1px;
+    left: -9999px;
+    top: -9999px;
+    opacity: 0;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+  <canvas id="surface"></canvas>
+  <video id="player" autoplay playsinline webkit-playsinline></video>
+  <script>
+    (() => {
+      const bridgeName = "floatReceiverBridge";
+      const surface = document.getElementById("surface");
+      const player = document.getElementById("player");
+      const surfaceContext = surface && surface.getContext ? surface.getContext("2d", { alpha: false }) : null;
+      let peerConnection = null;
+      let remoteStream = new MediaStream();
+      let pendingRemoteCandidates = [];
+      let frameLoopActive = false;
+      let frameLoopToken = 0;
+
+      player.autoplay = true;
+      player.playsInline = true;
+      player.controls = false;
+      player.srcObject = remoteStream;
+
+      function post(type, payload = {}) {
+        const handler = window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers[bridgeName];
+        if (!handler) {
+          return;
+        }
+        try {
+          handler.postMessage({ type, ...payload });
+        } catch (_) {}
+      }
+
+      function describeError(error, prefix) {
+        const message = error instanceof Error ? error.message : String(error);
+        return prefix ? `${prefix}: ${message}` : message;
+      }
+
+      function updateVideoSize() {
+        const width = Number(player.videoWidth || 0);
+        const height = Number(player.videoHeight || 0);
+        if (surface && width > 0 && height > 0) {
+          if (surface.width !== width) {
+            surface.width = width;
+          }
+          if (surface.height !== height) {
+            surface.height = height;
+          }
+        }
+        post("videoSize", { width, height });
+      }
+
+      async function ensurePlayback() {
+        try {
+          await player.play();
+        } catch (error) {
+          post("error", { reason: describeError(error, "player.play failed") });
+        }
+      }
+
+      function streamHasTrack(stream, track) {
+        return stream.getTracks().some((existing) => existing.id === track.id);
+      }
+
+      function attachTrack(track) {
+        if (!track) {
+          return;
+        }
+        if (!remoteStream || streamHasTrack(remoteStream, track)) {
+          return;
+        }
+
+        remoteStream.addTrack(track);
+        player.srcObject = remoteStream;
+        updateVideoSize();
+        void ensurePlayback();
+        post("streaming", { isStreaming: true });
+
+        track.addEventListener("ended", () => {
+          if (remoteStream) {
+            remoteStream.removeTrack(track);
+          }
+          if (!remoteStream || remoteStream.getTracks().length === 0) {
+            post("streaming", { isStreaming: false });
+          }
+        });
+
+        track.addEventListener("unmute", () => {
+          if (track.kind === "video") {
+            updateVideoSize();
+            startFrameLoop();
+          }
+          void ensurePlayback();
+        });
+      }
+
+      function drawCurrentFrame() {
+        if (!surfaceContext || !surface) {
+          return;
+        }
+        if (player.readyState < 2) {
+          return;
+        }
+        const targetWidth = Math.max(1, surface.width || player.videoWidth || 1);
+        const targetHeight = Math.max(1, surface.height || player.videoHeight || 1);
+        if (surface.width !== targetWidth) {
+          surface.width = targetWidth;
+        }
+        if (surface.height !== targetHeight) {
+          surface.height = targetHeight;
+        }
+        try {
+          surfaceContext.drawImage(player, 0, 0, targetWidth, targetHeight);
+        } catch (_) {}
+      }
+
+      function runFrameLoop(token) {
+        if (!frameLoopActive || token !== frameLoopToken) {
+          return;
+        }
+        drawCurrentFrame();
+        if (typeof player.requestVideoFrameCallback === "function") {
+          player.requestVideoFrameCallback(() => runFrameLoop(token));
+        } else {
+          window.requestAnimationFrame(() => runFrameLoop(token));
+        }
+      }
+
+      function startFrameLoop() {
+        if (frameLoopActive) {
+          return;
+        }
+        frameLoopActive = true;
+        frameLoopToken += 1;
+        runFrameLoop(frameLoopToken);
+      }
+
+      function stopFrameLoop() {
+        frameLoopActive = false;
+        frameLoopToken += 1;
+      }
+
+      async function flushPendingRemoteCandidates() {
+        if (!peerConnection || !peerConnection.remoteDescription) {
+          return;
+        }
+
+        while (pendingRemoteCandidates.length > 0) {
+          const candidate = pendingRemoteCandidates.shift();
+          try {
+            await peerConnection.addIceCandidate(candidate);
+          } catch (error) {
+            post("error", { reason: describeError(error, "addIceCandidate failed") });
+          }
+        }
+      }
+
+      function queueRemoteCandidate(candidate) {
+        if (!candidate || typeof candidate.candidate !== "string") {
+          return;
+        }
+
+        pendingRemoteCandidates.push({
+          candidate: candidate.candidate,
+          sdpMid: candidate.sdpMid ?? null,
+          sdpMLineIndex: candidate.sdpMLineIndex ?? null,
+        });
+
+        void flushPendingRemoteCandidates();
+      }
+
+      function createPeerConnection() {
+        if (typeof RTCPeerConnection !== "function") {
+          throw new Error("RTCPeerConnection is unavailable in this WKWebView context");
+        }
+
+        const pc = new RTCPeerConnection({ iceServers: [] });
+
+        pc.onicecandidate = (event) => {
+          if (!event.candidate) {
+            return;
+          }
+          post("localIce", {
+            candidate: event.candidate.candidate,
+            sdpMid: event.candidate.sdpMid,
+            sdpMLineIndex: event.candidate.sdpMLineIndex,
+          });
+        };
+
+        pc.ontrack = (event) => {
+          attachTrack(event.track);
+
+          if (event.streams && event.streams.length > 0) {
+            event.streams.forEach((stream) => {
+              stream.getTracks().forEach((track) => attachTrack(track));
+            });
+          }
+        };
+
+        pc.onconnectionstatechange = () => {
+          const state = pc.connectionState;
+          post("connectionState", { state });
+          if (state === "failed" || state === "closed" || state === "disconnected") {
+            post("streaming", { isStreaming: false });
+          }
+        };
+
+        return pc;
+      }
+
+      async function stopInternal() {
+        pendingRemoteCandidates = [];
+        stopFrameLoop();
+
+        if (peerConnection) {
+          peerConnection.onicecandidate = null;
+          peerConnection.ontrack = null;
+          peerConnection.onconnectionstatechange = null;
+          peerConnection.close();
+          peerConnection = null;
+        }
+
+        if (remoteStream) {
+          remoteStream.getTracks().forEach((track) => {
+            remoteStream.removeTrack(track);
+          });
+        }
+
+        remoteStream = new MediaStream();
+        player.pause();
+        player.srcObject = null;
+        player.srcObject = remoteStream;
+        if (surfaceContext && surface) {
+          surfaceContext.clearRect(0, 0, surface.width, surface.height);
+        }
+        post("streaming", { isStreaming: false });
+      }
+
+      window.addEventListener("error", (event) => {
+        const reason = event && event.message ? String(event.message) : "window error";
+        post("error", { reason });
+      });
+
+      window.addEventListener("unhandledrejection", (event) => {
+        const reason = event && event.reason ? String(event.reason) : "unhandled rejection";
+        post("error", { reason });
+      });
+
+      player.addEventListener("loadedmetadata", updateVideoSize);
+      player.addEventListener("resize", updateVideoSize);
+      player.addEventListener("playing", () => {
+        startFrameLoop();
+        post("streaming", { isStreaming: true });
+      });
+      player.addEventListener("ended", () => post("streaming", { isStreaming: false }));
+      player.addEventListener("error", () => post("error", { reason: "video element error" }));
+
+      window.FloatReceiver = {
+        async handleOffer(offerSdp) {
+          if (typeof offerSdp !== "string" || offerSdp.length === 0) {
+            throw new Error("Missing offer SDP");
+          }
+
+          await stopInternal();
+
+          peerConnection = createPeerConnection();
+          await peerConnection.setRemoteDescription({ type: "offer", sdp: offerSdp });
+
+          const answer = await peerConnection.createAnswer();
+          await peerConnection.setLocalDescription(answer);
+          await flushPendingRemoteCandidates();
+
+          void ensurePlayback();
+
+          return (peerConnection.localDescription && peerConnection.localDescription.sdp) || answer.sdp || "";
+        },
+
+        async addIceCandidate(candidate) {
+          queueRemoteCandidate(candidate);
+        },
+
+        async stop() {
+          await stopInternal();
+        }
+      };
+
+      post("ready", {
+        userAgent: navigator.userAgent,
+        isSecureContext: Boolean(window.isSecureContext),
+        hasRTCPeerConnection: typeof RTCPeerConnection === "function",
+      });
+    })();
+  </script>
+</body>
+</html>

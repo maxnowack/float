@@ -20,6 +20,7 @@ enum WebRTCReceiverError: LocalizedError {
     case notConfigured
     case peerConnectionUnavailable
     case missingPeerConnection
+    case bridgeNotReady
 
     var errorDescription: String? {
         switch self {
@@ -29,6 +30,8 @@ enum WebRTCReceiverError: LocalizedError {
             return "Failed to create WebRTC peer connection."
         case .missingPeerConnection:
             return "No active WebRTC peer connection."
+        case .bridgeNotReady:
+            return "Web receiver page did not initialize in time."
         }
     }
 }
@@ -53,7 +56,7 @@ final class StubWebRTCReceiver: WebRTCReceiver {
 }
 
 func makeWebRTCReceiver() -> WebRTCReceiver {
-#if canImport(WebRTC)
+#if canImport(WebKit)
     NativeWebRTCReceiver()
 #else
     StubWebRTCReceiver()
