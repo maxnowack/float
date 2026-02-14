@@ -83,10 +83,16 @@ final class SignalingServer: ObservableObject {
                     print("[Float Signal] receiver.onStreamingChanged value=\(isStreaming)")
                 }
                 self?.isStreaming = isStreaming
-                if !isStreaming {
-                    self?.activeTabId = nil
-                    self?.activeVideoId = nil
-                }
+            }
+        }
+        receiver.onPlaybackCommand = { [weak self] isPlaying in
+            Task { @MainActor [weak self] in
+                self?.requestPlaybackChange(isPlaying: isPlaying)
+            }
+        }
+        receiver.onSeekCommand = { [weak self] intervalSeconds in
+            Task { @MainActor [weak self] in
+                self?.requestSeekChange(intervalSeconds: intervalSeconds)
             }
         }
         start()
@@ -140,6 +146,7 @@ final class SignalingServer: ObservableObject {
     func requestStart(tabId: Int, videoId: String) {
         activeTabId = tabId
         activeVideoId = videoId
+        webRTCReceiver.updatePlaybackState(isPlaying: true)
         let payload: [String: Any] = [
             "type": FloatProtocol.MessageType.start,
             "tabId": tabId,
@@ -271,6 +278,7 @@ final class SignalingServer: ObservableObject {
                 let state = try decoder.decode(StateMessage.self, from: data)
                 Task { @MainActor in
                     self.tabs = state.tabs
+                    self.syncReceiverPlaybackStateFromTabs()
                 }
             case FloatProtocol.MessageType.stop:
                 webRTCReceiver.stop()
@@ -323,6 +331,56 @@ final class SignalingServer: ObservableObject {
         sendToClient(clientID, payload: payload)
     }
 
+    private func requestPlaybackChange(isPlaying: Bool) {
+        guard let activeTabId, let activeVideoId else {
+            if protocolDebugLoggingEnabled {
+                print("[Float Signal] requestPlaybackChange dropped: missing active target")
+            }
+            return
+        }
+        sendToAnyClient([
+            "type": FloatProtocol.MessageType.playback,
+            "tabId": activeTabId,
+            "videoId": activeVideoId,
+            "playing": isPlaying,
+        ])
+    }
+
+    private func requestSeekChange(intervalSeconds: Double) {
+        guard intervalSeconds.isFinite else { return }
+        guard let activeTabId, let activeVideoId else {
+            if protocolDebugLoggingEnabled {
+                print("[Float Signal] requestSeekChange dropped: missing active target")
+            }
+            return
+        }
+        sendToAnyClient([
+            "type": FloatProtocol.MessageType.seek,
+            "tabId": activeTabId,
+            "videoId": activeVideoId,
+            "intervalSeconds": intervalSeconds,
+        ])
+    }
+
+    private func syncReceiverPlaybackStateFromTabs() {
+        guard let activeTabId, let activeVideoId else {
+            return
+        }
+        guard let tab = tabs.first(where: { $0.tabId == activeTabId }) else {
+            return
+        }
+        guard let video = tab.videos.first(where: { $0.videoId == activeVideoId }) else {
+            if protocolDebugLoggingEnabled {
+                print("[Float Signal] syncReceiverPlaybackStateFromTabs: active video not found videoId=\(activeVideoId) tabId=\(activeTabId)")
+            }
+            return
+        }
+        if let playing = video.playing {
+            webRTCReceiver.updatePlaybackState(isPlaying: playing)
+        }
+        webRTCReceiver.updatePlaybackProgress(elapsedSeconds: video.currentTime, durationSeconds: video.duration)
+    }
+
     private func sendToClient(_ clientID: UUID, payload: [String: Any]) {
         guard let client = clients[clientID] else { return }
 
@@ -350,6 +408,8 @@ final class SignalingServer: ObservableObject {
 
     private func handleOffer(_ offer: OfferMessage, clientID: UUID) async {
         do {
+            activeTabId = offer.tabId
+            activeVideoId = offer.videoId
             let answerSDP = try await webRTCReceiver.handleOffer(offer)
             let answer = AnswerMessage(
                 type: FloatProtocol.MessageType.answer,

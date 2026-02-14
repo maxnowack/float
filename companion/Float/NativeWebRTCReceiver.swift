@@ -2,12 +2,15 @@
 import AppKit
 import Darwin
 import Foundation
+import ObjectiveC.runtime
 import WebKit
 
 @MainActor
 final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
     var onLocalIceCandidate: ((LocalIceCandidate) -> Void)?
     var onStreamingChanged: ((Bool) -> Void)?
+    var onPlaybackCommand: ((Bool) -> Void)?
+    var onSeekCommand: ((Double) -> Void)?
 
     private let scriptMessageName = "floatReceiverBridge"
     private let pipController = NativePiPController()
@@ -22,6 +25,12 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
 
         pipController.onPictureInPictureClosed = { [weak self] in
             self?.stop()
+        }
+        pipController.onPlaybackCommand = { [weak self] isPlaying in
+            self?.onPlaybackCommand?(isPlaying)
+        }
+        pipController.onSeekCommand = { [weak self] intervalSeconds in
+            self?.onSeekCommand?(intervalSeconds)
         }
 
         let userContentController = pipController.webView.configuration.userContentController
@@ -82,6 +91,14 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
 
         pipController.webView.evaluateJavaScript("window.FloatReceiver && window.FloatReceiver.stop();", completionHandler: nil)
         pipController.stop()
+    }
+
+    func updatePlaybackState(isPlaying: Bool) {
+        pipController.updatePlaybackState(isPlaying)
+    }
+
+    func updatePlaybackProgress(elapsedSeconds: Double?, durationSeconds: Double?) {
+        pipController.updatePlaybackProgress(elapsedSeconds: elapsedSeconds, durationSeconds: durationSeconds)
     }
 
     private func waitForBridgeReady() async throws {
@@ -190,6 +207,8 @@ private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
 @MainActor
 private final class NativePiPController: NSObject {
     var onPictureInPictureClosed: (() -> Void)?
+    var onPlaybackCommand: ((Bool) -> Void)?
+    var onSeekCommand: ((Double) -> Void)?
 
     let webView: WKWebView
 
@@ -207,7 +226,16 @@ private final class NativePiPController: NSObject {
     private var privatePiPPanelCloseObserver: NSObjectProtocol?
     private var privatePiPVisibilityWatchdog: Timer?
     private var isObservingPrivatePiPPanel = false
+    private var isObservingPrivatePiPPlaying = false
     private var privatePiPPanelKVOContext = 0
+    private var privatePiPPlayingKVOContext = 0
+    private var isUpdatingPlaybackStateProgrammatically = false
+    private var defaultPrivatePiPControls: UInt64 = 3
+    private var defaultPrivatePiPControlStyle: Int = 1
+    private var playbackElapsedSeconds: Double = 0
+    private var playbackAnchorDate: Date?
+    private var playbackIsPlaying = true
+    private var playbackDurationSeconds: Double = 0
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -217,6 +245,13 @@ private final class NativePiPController: NSObject {
         webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         setupIfNeeded()
+    }
+
+    deinit {
+        if isObservingPrivatePiPPlaying, let controller = privatePiPController {
+            controller.removeObserver(self, forKeyPath: "playing", context: &privatePiPPlayingKVOContext)
+            isObservingPrivatePiPPlaying = false
+        }
     }
 
     func loadReceiverPage(_ html: String) {
@@ -253,6 +288,33 @@ private final class NativePiPController: NSObject {
 
         expectedVideoAspectRatio = ratio
         applyPrivatePiPAspectConstraints()
+    }
+
+    func updatePlaybackState(_ isPlaying: Bool) {
+        updatePlaybackClock(isPlaying: isPlaying)
+        pushPlaybackStateToPiPController()
+    }
+
+    func updatePlaybackProgress(elapsedSeconds: Double?, durationSeconds: Double?) {
+        if let elapsedSeconds, elapsedSeconds.isFinite, elapsedSeconds >= 0 {
+            playbackElapsedSeconds = elapsedSeconds
+            if playbackIsPlaying {
+                playbackAnchorDate = Date()
+            }
+        }
+
+        if let durationSeconds {
+            if durationSeconds.isFinite, durationSeconds > 0 {
+                playbackDurationSeconds = durationSeconds
+            } else if !durationSeconds.isFinite {
+                playbackDurationSeconds = .infinity
+            } else {
+                playbackDurationSeconds = 0
+            }
+        }
+
+        playbackElapsedSeconds = clampElapsedTime(playbackElapsedSeconds)
+        pushPlaybackStateToPiPController()
     }
 
     private func setupIfNeeded() {
@@ -298,9 +360,52 @@ private final class NativePiPController: NSObject {
             return false
         }
 
+        ensurePrivatePiPDelegateProtocolConformance()
         privatePiPController = controller
+        _ = callObjectSetter(on: controller, selectorName: "setDelegate:", value: self)
+        let defaultControls = callUInt64Getter(on: controller, selectorName: "controls") ?? 3
+        defaultPrivatePiPControls = defaultControls == 0 ? 3 : defaultControls
+        let defaultStyle = callIntGetter(on: controller, selectorName: "controlStyle") ?? 1
+        defaultPrivatePiPControlStyle = defaultStyle
+        applyPrivatePiPControlsConfiguration()
+        _ = updatePrivatePlaybackState(on: controller, isPlaying: true)
+        logPrivatePlaybackState(prefix: "[Float PiP] playback configured")
+        if let effectiveControls = callUInt64Getter(on: controller, selectorName: "controls"),
+           let effectiveStyle = callIntGetter(on: controller, selectorName: "controlStyle")
+        {
+            print("[Float PiP] controls configured default=\(defaultControls) requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle) defaultStyle=\(defaultStyle)")
+        }
+        controller.addObserver(self, forKeyPath: "playing", options: [.new], context: &privatePiPPlayingKVOContext)
+        isObservingPrivatePiPPlaying = true
         applyPrivatePiPAspectConstraints()
         return true
+    }
+
+    private func ensurePrivatePiPDelegateProtocolConformance() {
+        let cls: AnyClass = type(of: self)
+        for protocolName in ["PIPClientXPCProtocol", "PIPViewControllerDelegate"] {
+            guard let protocolRef = NSProtocolFromString(protocolName) else { continue }
+            if class_conformsToProtocol(cls, protocolRef) {
+                continue
+            }
+            _ = class_addProtocol(cls, protocolRef)
+        }
+
+        let clientConforms = NSProtocolFromString("PIPClientXPCProtocol").map { class_conformsToProtocol(cls, $0) } ?? false
+        let legacyConforms = NSProtocolFromString("PIPViewControllerDelegate").map { class_conformsToProtocol(cls, $0) } ?? false
+        print("[Float PiP] delegate conformance client=\(clientConforms) legacy=\(legacyConforms)")
+
+        for selectorName in [
+            "clientPIP:setPlaying:",
+            "clientPIP:action:",
+            "clientPIP:skipInterval:",
+            "pipActionPlay:",
+            "pipActionPause:",
+            "pipActionStop:",
+        ] {
+            let responds = responds(to: NSSelectorFromString(selectorName))
+            print("[Float PiP] delegate responds \(selectorName)=\(responds)")
+        }
     }
 
     private func attemptStartPiP() {
@@ -324,7 +429,22 @@ private final class NativePiPController: NSObject {
         isStartingPictureInPicture = false
 
         guard didPresent else { return }
+        applyPrivatePiPControlsConfiguration()
+        _ = updatePrivatePlaybackState(on: privatePiPController, isPlaying: playbackIsPlaying)
+        callBoolSetter(on: privatePiPController, selectorName: "setPlaying:", value: playbackIsPlaying)
+        logPrivatePlaybackState(prefix: "[Float PiP] playback after present")
+        if let effectiveControls = callUInt64Getter(on: privatePiPController, selectorName: "controls"),
+           let effectiveStyle = callIntGetter(on: privatePiPController, selectorName: "controlStyle")
+        {
+            print("[Float PiP] controls after present requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle)")
+        }
         handlePrivatePiPStateDidChange(isPresented: true, notifyExternalClose: false)
+    }
+
+    private func applyPrivatePiPControlsConfiguration() {
+        guard let controller = privatePiPController else { return }
+        callUInt64Setter(on: controller, selectorName: "setControls:", value: defaultPrivatePiPControls)
+        callIntSetter(on: controller, selectorName: "setControlStyle:", value: defaultPrivatePiPControlStyle)
     }
 
     private func applyPrivatePiPAspectConstraints() {
@@ -352,6 +472,26 @@ private final class NativePiPController: NSObject {
         guard controller.responds(to: selector) else { return }
 
         typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Setter.self)
+        fn(controller, selector, value)
+    }
+
+    private func callIntSetter(on controller: NSObject, selectorName: String, value: Int) {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return }
+
+        typealias Setter = @convention(c) (AnyObject, Selector, Int) -> Void
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Setter.self)
+        fn(controller, selector, value)
+    }
+
+    private func callUInt64Setter(on controller: NSObject, selectorName: String, value: UInt64) {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return }
+
+        typealias Setter = @convention(c) (AnyObject, Selector, UInt64) -> Void
         let imp = controller.method(for: selector)
         let fn = unsafeBitCast(imp, to: Setter.self)
         fn(controller, selector, value)
@@ -389,6 +529,155 @@ private final class NativePiPController: NSObject {
         let imp = controller.method(for: selector)
         let fn = unsafeBitCast(imp, to: Getter.self)
         return fn(controller, selector)
+    }
+
+    private func callBoolGetter(on controller: NSObject, selectorName: String) -> Bool? {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return nil }
+
+        typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Getter.self)
+        return fn(controller, selector)
+    }
+
+    private func callIntGetter(on controller: NSObject, selectorName: String) -> Int? {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return nil }
+
+        typealias Getter = @convention(c) (AnyObject, Selector) -> Int
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Getter.self)
+        return fn(controller, selector)
+    }
+
+    private func callUInt64Getter(on controller: NSObject, selectorName: String) -> UInt64? {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return nil }
+
+        typealias Getter = @convention(c) (AnyObject, Selector) -> UInt64
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Getter.self)
+        return fn(controller, selector)
+    }
+
+    private func updatePrivatePlaybackState(on controller: NSObject, isPlaying: Bool) -> Bool {
+        let selector = NSSelectorFromString("updatePlaybackStateUsingBlock:")
+        guard controller.responds(to: selector) else { return false }
+
+        let elapsed = currentPlaybackElapsedSeconds()
+        let block: @convention(block) (AnyObject) -> Void = { state in
+            guard let stateObject = state as? NSObject else { return }
+            self.callBoolSetter(on: stateObject, selectorName: "setMuted:", value: false)
+            self.callBoolSetter(on: stateObject, selectorName: "setRequiresLinearPlayback:", value: false)
+            let isLive = !self.playbackDurationSeconds.isFinite || self.playbackDurationSeconds <= 0
+            self.callIntSetter(on: stateObject, selectorName: "setContentType:", value: isLive ? 1 : 0)
+            self.callDoubleSetter(
+                on: stateObject,
+                selectorName: "setContentDuration:",
+                value: isLive ? 0 : self.playbackDurationSeconds
+            )
+            self.callPlaybackTimingSetter(
+                on: stateObject,
+                selectorName: "setPlaybackRate:elapsedTime:timeControlStatus:",
+                playbackRate: isPlaying ? 1.0 : 0.0,
+                elapsedTime: elapsed,
+                timeControlStatus: isPlaying ? 2 : 0
+            )
+        }
+
+        return callObjectSetter(on: controller, selectorName: "updatePlaybackStateUsingBlock:", value: unsafeBitCast(block, to: AnyObject.self))
+    }
+
+    private func callDoubleSetter(on controller: NSObject, selectorName: String, value: Double) {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return }
+
+        typealias Setter = @convention(c) (AnyObject, Selector, Double) -> Void
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Setter.self)
+        fn(controller, selector, value)
+    }
+
+    private func callDoubleGetter(on controller: NSObject, selectorName: String) -> Double? {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return nil }
+
+        typealias Getter = @convention(c) (AnyObject, Selector) -> Double
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Getter.self)
+        return fn(controller, selector)
+    }
+
+    private func callPlaybackTimingSetter(
+        on controller: NSObject,
+        selectorName: String,
+        playbackRate: Double,
+        elapsedTime: Double,
+        timeControlStatus: Int
+    ) {
+        let selector = NSSelectorFromString(selectorName)
+        guard controller.responds(to: selector) else { return }
+
+        typealias Setter = @convention(c) (AnyObject, Selector, Double, Double, Int) -> Void
+        let imp = controller.method(for: selector)
+        let fn = unsafeBitCast(imp, to: Setter.self)
+        fn(controller, selector, playbackRate, elapsedTime, timeControlStatus)
+    }
+
+    private func updatePlaybackClock(isPlaying: Bool) {
+        let now = Date()
+        if playbackIsPlaying, let anchor = playbackAnchorDate {
+            playbackElapsedSeconds += now.timeIntervalSince(anchor)
+        }
+        playbackElapsedSeconds = max(0, playbackElapsedSeconds)
+        playbackIsPlaying = isPlaying
+        playbackAnchorDate = isPlaying ? now : nil
+    }
+
+    private func currentPlaybackElapsedSeconds() -> Double {
+        if playbackIsPlaying, let anchor = playbackAnchorDate {
+            return max(0, playbackElapsedSeconds + Date().timeIntervalSince(anchor))
+        }
+        return max(0, playbackElapsedSeconds)
+    }
+
+    private func clampElapsedTime(_ elapsed: Double) -> Double {
+        let lowerBounded = max(0, elapsed)
+        if playbackDurationSeconds.isFinite, playbackDurationSeconds > 0 {
+            return min(playbackDurationSeconds, lowerBounded)
+        }
+        return lowerBounded
+    }
+
+    private func pushPlaybackStateToPiPController() {
+        guard let controller = privatePiPController else { return }
+        isUpdatingPlaybackStateProgrammatically = true
+        _ = updatePrivatePlaybackState(on: controller, isPlaying: playbackIsPlaying)
+        // Keep deprecated state in sync; some macOS builds still gate play/pause controls on it.
+        callBoolSetter(on: controller, selectorName: "setPlaying:", value: playbackIsPlaying)
+        isUpdatingPlaybackStateProgrammatically = false
+    }
+
+    private func forwardSeekCommand(interval: Double) {
+        guard interval.isFinite else { return }
+
+        playbackElapsedSeconds = clampElapsedTime(currentPlaybackElapsedSeconds() + interval)
+        playbackAnchorDate = playbackIsPlaying ? Date() : nil
+        pushPlaybackStateToPiPController()
+        onSeekCommand?(interval)
+    }
+
+    private func logPrivatePlaybackState(prefix: String) {
+        guard let controller = privatePiPController else { return }
+        guard let state = callObjectGetter(on: controller, selectorName: "playbackState") as? NSObject else { return }
+
+        let contentType = callIntGetter(on: state, selectorName: "contentType") ?? -1
+        let duration = callDoubleGetter(on: state, selectorName: "contentDuration") ?? -1
+        let elapsed = callDoubleGetter(on: state, selectorName: "elapsedTime") ?? -1
+        let rate = callDoubleGetter(on: state, selectorName: "playbackRate") ?? -1
+        let timeControlStatus = callIntGetter(on: state, selectorName: "timeControlStatus") ?? -1
+        print("\(prefix) contentType=\(contentType) duration=\(duration) elapsed=\(elapsed) rate=\(rate) status=\(timeControlStatus)")
     }
 
     private func dismissPrivatePictureInPicture(on controller: NSObject) -> Bool {
@@ -522,6 +811,14 @@ private final class NativePiPController: NSObject {
         change: [NSKeyValueChangeKey: Any]?,
         context: UnsafeMutableRawPointer?
     ) {
+        if context == &privatePiPPlayingKVOContext {
+            guard !isUpdatingPlaybackStateProgrammatically else { return }
+            guard let controller = privatePiPController else { return }
+            guard let isPlaying = callBoolGetter(on: controller, selectorName: "playing") else { return }
+            onPlaybackCommand?(isPlaying)
+            return
+        }
+
         guard context == &privatePiPPanelKVOContext else {
             super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
             return
@@ -529,6 +826,87 @@ private final class NativePiPController: NSObject {
 
         guard keyPath == "panel" else { return }
         refreshPrivatePiPPanelFromController()
+    }
+
+    @objc(clientPIP:setPlaying:)
+    func clientPIP(_ pipID: UInt32, setPlaying isPlaying: Bool) {
+        _ = pipID
+        forwardPlaybackCommand(isPlaying: isPlaying)
+    }
+
+    @objc(clientPIP:action:)
+    func clientPIP(_ pipID: UInt32, action: Int64) {
+        _ = pipID
+        if action == 0 {
+            forwardPlaybackCommand(isPlaying: !playbackIsPlaying)
+            return
+        }
+        if action == 1 {
+            forwardPlaybackCommand(isPlaying: true)
+            return
+        }
+        if action == 2 {
+            forwardPlaybackCommand(isPlaying: false)
+            return
+        }
+
+        print("[Float PiP] unhandled action=\(action)")
+    }
+
+    @objc(clientPIP:willCloseWithCompletion:)
+    func clientPIP(_ pipID: UInt32, willCloseWithCompletion completion: @escaping () -> Void) {
+        _ = pipID
+        completion()
+    }
+
+    @objc(clientPIP:setWindowContentRect:completion:)
+    func clientPIP(_ pipID: UInt32, setWindowContentRect rect: CGRect, completion: @escaping () -> Void) {
+        _ = pipID
+        _ = rect
+        completion()
+    }
+
+    @objc(clientPIP:setMicrophoneMuted:)
+    func clientPIP(_ pipID: UInt32, setMicrophoneMuted muted: Bool) {
+        _ = pipID
+        _ = muted
+    }
+
+    @objc(clientPIP:skipInterval:)
+    func clientPIP(_ pipID: UInt32, skipInterval interval: Double) {
+        _ = pipID
+        forwardSeekCommand(interval: interval)
+    }
+
+    @objc(pipAction:skipInterval:)
+    func pipAction(_ pip: Any?, skipInterval interval: Double) {
+        _ = pip
+        forwardSeekCommand(interval: interval)
+    }
+
+    // Legacy PIPViewControllerDelegate callbacks still used by some macOS builds.
+    @objc(pipActionPlay:)
+    func pipActionPlay(_ pip: Any?) {
+        _ = pip
+        forwardPlaybackCommand(isPlaying: true)
+    }
+
+    @objc(pipActionPause:)
+    func pipActionPause(_ pip: Any?) {
+        _ = pip
+        forwardPlaybackCommand(isPlaying: false)
+    }
+
+    @objc(pipActionStop:)
+    func pipActionStop(_ pip: Any?) {
+        _ = pip
+        forwardPlaybackCommand(isPlaying: false)
+    }
+
+    private func forwardPlaybackCommand(isPlaying: Bool) {
+        updatePlaybackClock(isPlaying: isPlaying)
+        pushPlaybackStateToPiPController()
+        onPlaybackCommand?(isPlaying)
     }
 }
 #endif

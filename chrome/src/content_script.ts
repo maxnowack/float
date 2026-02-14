@@ -3,6 +3,8 @@ type ContentVideoCandidate = {
   playing: boolean;
   muted: boolean;
   resolution: string;
+  currentTime: number | null;
+  duration: number | null;
 };
 
 type VideoMeta = {
@@ -16,6 +18,7 @@ let scheduled = false;
 let activePeer: RTCPeerConnection | null = null;
 let activeStream: MediaStream | null = null;
 let activeVideoId: string | null = null;
+let activeSourceVideo: HTMLVideoElement | null = null;
 let sourceProbeTimerId: number | null = null;
 const FLOAT_TARGET_WIDTH = 1280;
 const FLOAT_TARGET_HEIGHT = 720;
@@ -69,7 +72,12 @@ function collectCandidates(): ContentVideoCandidate[] {
   const videos = document.querySelectorAll("video");
 
   videos.forEach((video) => {
-    if (!(video instanceof HTMLVideoElement) || !isEligible(video)) {
+    if (!(video instanceof HTMLVideoElement)) {
+      return;
+    }
+
+    const shouldInclude = isEligible(video) || (activeSourceVideo !== null && video === activeSourceVideo);
+    if (!shouldInclude) {
       return;
     }
 
@@ -81,6 +89,8 @@ function collectCandidates(): ContentVideoCandidate[] {
       playing: !video.paused,
       muted: video.muted || video.volume === 0,
       resolution,
+      currentTime: Number.isFinite(video.currentTime) ? video.currentTime : null,
+      duration: Number.isFinite(video.duration) && video.duration > 0 ? video.duration : null,
     });
   });
 
@@ -306,6 +316,7 @@ function stopStreaming(): void {
       videoId: activeVideoId,
     });
   }
+  activeSourceVideo = null;
   activeVideoId = null;
 }
 
@@ -416,6 +427,7 @@ async function startStreaming(videoId: string): Promise<void> {
     activePeer = peer;
     activeStream = stream;
     activeVideoId = selectedVideoId;
+    activeSourceVideo = video;
 
     chrome.runtime.sendMessage({
       type: "float:webrtc:offer",
@@ -427,6 +439,68 @@ async function startStreaming(videoId: string): Promise<void> {
     notifyWebRTCError(reason);
     peer.close();
     stream.getTracks().forEach((track) => track.stop());
+    activeSourceVideo = null;
+  }
+}
+
+async function applyPlaybackControl(videoId: string, playing: boolean): Promise<void> {
+  if (activeVideoId !== videoId) {
+    return;
+  }
+
+  const target = activeSourceVideo ?? findVideoById(videoId);
+  if (!target) {
+    notifyWebRTCError(`Playback control target not found for ${videoId}`);
+    return;
+  }
+
+  activeSourceVideo = target;
+
+  try {
+    if (playing) {
+      await target.play();
+    } else {
+      target.pause();
+    }
+    scheduleEmit();
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "failed to apply playback control";
+    notifyWebRTCError(reason);
+  }
+}
+
+function applySeekControl(videoId: string, intervalSeconds: number): void {
+  if (activeVideoId !== videoId) {
+    return;
+  }
+  if (!Number.isFinite(intervalSeconds)) {
+    return;
+  }
+
+  const target = activeSourceVideo ?? findVideoById(videoId);
+  if (!target) {
+    notifyWebRTCError(`Seek target not found for ${videoId}`);
+    return;
+  }
+
+  activeSourceVideo = target;
+
+  const current = Number.isFinite(target.currentTime) ? target.currentTime : 0;
+  const duration = Number.isFinite(target.duration) && target.duration > 0 ? target.duration : null;
+  let nextTime = current + intervalSeconds;
+
+  if (duration !== null) {
+    nextTime = Math.min(duration, Math.max(0, nextTime));
+  } else {
+    nextTime = Math.max(0, nextTime);
+  }
+
+  try {
+    target.currentTime = nextTime;
+    scheduleEmit();
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "failed to apply seek control";
+    notifyWebRTCError(reason);
   }
 }
 
@@ -472,6 +546,24 @@ chrome.runtime.onMessage.addListener((message: any) => {
 
   if (message.type === "float:stop") {
     stopStreaming();
+    return;
+  }
+
+  if (
+    message.type === "float:playback" &&
+    typeof message.videoId === "string" &&
+    typeof message.playing === "boolean"
+  ) {
+    void applyPlaybackControl(message.videoId, message.playing);
+    return;
+  }
+
+  if (
+    message.type === "float:seek" &&
+    typeof message.videoId === "string" &&
+    typeof message.intervalSeconds === "number"
+  ) {
+    applySeekControl(message.videoId, message.intervalSeconds);
     return;
   }
 

@@ -11,6 +11,8 @@ if (!globalScope.FloatProtocol) {
       answer: "answer",
       ice: "ice",
       stop: "stop",
+      playback: "playback",
+      seek: "seek",
       error: "error",
       debug: "debug",
     },
@@ -46,6 +48,36 @@ function isStartMessage(message: unknown): message is { type: "start"; tabId: nu
 
 function isStopMessage(message: unknown): message is { type: "stop" } {
   return isUnknownRecord(message) && message.type === FloatProtocol.messageType.stop;
+}
+
+function isPlaybackMessage(
+  message: unknown,
+): message is { type: "playback"; tabId: number; videoId: string; playing: boolean } {
+  if (!isUnknownRecord(message)) {
+    return false;
+  }
+
+  return (
+    message.type === FloatProtocol.messageType.playback &&
+    typeof message.tabId === "number" &&
+    typeof message.videoId === "string" &&
+    typeof message.playing === "boolean"
+  );
+}
+
+function isSeekMessage(
+  message: unknown,
+): message is { type: "seek"; tabId: number; videoId: string; intervalSeconds: number } {
+  if (!isUnknownRecord(message)) {
+    return false;
+  }
+
+  return (
+    message.type === FloatProtocol.messageType.seek &&
+    typeof message.tabId === "number" &&
+    typeof message.videoId === "string" &&
+    typeof message.intervalSeconds === "number"
+  );
 }
 
 function isAnswerMessage(
@@ -100,6 +132,8 @@ function asErrorMessage(reason: string): { type: "error"; reason: string } {
 globalScope.FloatProtocolReadTypeField = readTypeField;
 globalScope.FloatProtocolIsStartMessage = isStartMessage;
 globalScope.FloatProtocolIsStopMessage = isStopMessage;
+globalScope.FloatProtocolIsPlaybackMessage = isPlaybackMessage;
+globalScope.FloatProtocolIsSeekMessage = isSeekMessage;
 globalScope.FloatProtocolIsAnswerMessage = isAnswerMessage;
 globalScope.FloatProtocolIsIceMessage = isIceMessage;
 globalScope.FloatProtocolError = asErrorMessage;

@@ -11,6 +11,8 @@ type WorkerVideoCandidate = {
   playing: boolean;
   muted: boolean;
   resolution: string;
+  currentTime?: number | null;
+  duration?: number | null;
 };
 
 type FrameState = {
@@ -239,6 +241,8 @@ function onOfferFromContent(message: any, sender: any): void {
   }
 
   muteTabForStreaming(tabId);
+  activeStreamTarget = { tabId, videoId: message.videoId };
+  desiredMutedTabId = tabId;
 
   sendSocketMessage({
     type: FloatProtocol.messageType.offer,
@@ -396,6 +400,24 @@ function handleCompanionMessage(raw: unknown): void {
           chrome.tabs.sendMessage(tab.id, { type: "float:stop" });
         }
       });
+    });
+    return;
+  }
+
+  if (FloatProtocolIsPlaybackMessage(parsed)) {
+    chrome.tabs.sendMessage(parsed.tabId, {
+      type: "float:playback",
+      videoId: parsed.videoId,
+      playing: parsed.playing,
+    });
+    return;
+  }
+
+  if (FloatProtocolIsSeekMessage(parsed)) {
+    chrome.tabs.sendMessage(parsed.tabId, {
+      type: "float:seek",
+      videoId: parsed.videoId,
+      intervalSeconds: parsed.intervalSeconds,
     });
     return;
   }

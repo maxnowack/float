@@ -1,41 +1,62 @@
 # Float Repository Guide
 
-## What this repo is
-Float is a local two-part system for turning a browser video into a native macOS Picture-in-Picture stream that can stay visible across Spaces/fullscreen apps.
+## Overview
+Float is a local browser-to-macOS Picture-in-Picture system:
 
-- `chrome/`: Chromium extension (Manifest V3, TypeScript) that detects candidate videos and captures a selected one with `captureStream()`.
-- `companion/`: macOS menu bar app (Swift/SwiftUI + AppKit) that receives the WebRTC stream and renders it in native PiP.
+- `chrome/`: Chromium MV3 extension that detects page videos, captures a selected source via `captureStream()`, and streams it over WebRTC.
+- `companion/`: macOS menu bar app that runs local signaling and presents the stream in native PiP.
 
-## Top-level structure
+All signaling is local-only over `ws://127.0.0.1:17891`.
 
-- `chrome/manifest.json`: extension permissions, content script wiring, background service worker entry.
-- `chrome/src/content_script.ts`: video discovery, candidate updates, WebRTC sender (`offer`/`ice`), stream lifecycle.
-- `chrome/src/service_worker.ts`: localhost WebSocket client (`ws://127.0.0.1:17891`), tab/frame state aggregation, signaling bridge to companion.
-- `chrome/src/protocol.ts`: shared protocol constants and runtime type guards for protocol messages.
-- `companion/Float/FloatApp.swift`: app entry, status bar item behavior, source-selection/quit menus.
-- `companion/Float/SignalingServer.swift`: localhost WebSocket server, protocol routing, source model for UI, start/stop commands.
-- `companion/Float/Protocol.swift`: Swift protocol models (`hello`, `state`, `start`, `offer`, `answer`, `ice`, `stop`, `error`, `debug`).
-- `companion/Float/WebRTCReceiver.swift`: receiver abstraction + stub fallback.
-- `companion/Float/NativeWebRTCReceiver.swift`: native WebRTC peer connection, frame conversion to `CMSampleBuffer`, PiP controller integration.
-- `INSTRUCTIONS.md`: product goals and implementation plan.
-- `AGENT_PLAN.md` / `AGENT_STATUS.md`: progress log and milestone tracking.
+## Repository layout
 
-## Runtime data flow
+### Extension (`/Users/maxnowack/code/float/chrome`)
 
-1. Content script scans each frame for eligible `<video>` elements and reports candidates to the service worker (`float:videos:update`).
-2. Service worker merges per-frame state by tab and pushes `state` messages to the companion over WebSocket.
-3. Companion status item reflects source availability and can request start/stop (`start` / `stop`) back to the extension.
-4. On `start`, content script finds the selected video, captures media, creates `RTCPeerConnection`, sends `offer` and ICE candidates.
-5. Companion `SignalingServer` forwards signaling to `NativeWebRTCReceiver`, returns `answer`, and relays local ICE.
-6. Companion converts incoming WebRTC frames to sample buffers and renders them through native PiP.
-7. On stop/disconnect/tab close, both sides tear down peer/media state and refresh source availability.
+- `/Users/maxnowack/code/float/chrome/manifest.json`: MV3 manifest, permissions, service worker, and content-script injection.
+- `/Users/maxnowack/code/float/chrome/src/protocol.ts`: protocol constants + runtime type guards (`start`, `stop`, `offer`, `answer`, `ice`, `playback`, `error`, `debug`).
+- `/Users/maxnowack/code/float/chrome/src/globals.d.ts`: global declarations for protocol helpers and `captureStream()`.
+- `/Users/maxnowack/code/float/chrome/src/service_worker.ts`: background bridge between tabs and companion WebSocket, tab/frame state aggregation, tab mute/unmute lifecycle while streaming, signaling forwarding.
+- `/Users/maxnowack/code/float/chrome/src/content_script.ts`: video discovery, candidate updates, WebRTC sender, debug probes, and playback control application (`float:playback`).
+
+### Companion (`/Users/maxnowack/code/float/companion`)
+
+- `/Users/maxnowack/code/float/companion/Float/FloatApp.swift`: menu bar app entry and status item interaction.
+- `/Users/maxnowack/code/float/companion/Float/SignalingServer.swift`: localhost WebSocket server, protocol routing, active source tracking, playback command forwarding.
+- `/Users/maxnowack/code/float/companion/Float/Protocol.swift`: Swift protocol models and message-type constants.
+- `/Users/maxnowack/code/float/companion/Float/WebRTCReceiver.swift`: receiver interface, stub fallback, and factory.
+- `/Users/maxnowack/code/float/companion/Float/NativeWebRTCReceiver.swift`: current receiver implementation backed by `WKWebView` bridge + private PiP integration.
+- `/Users/maxnowack/code/float/companion/Float/receiver.html`: in-app WebRTC receiver page (RTCPeerConnection + hidden `<video>` + canvas surface + JS-to-Swift bridge).
+- `/Users/maxnowack/code/float/companion/Float/Float.entitlements`: sandbox and network client/server permissions.
+
+## Current architecture (important)
+
+Companion receiving is currently WebKit-based:
+
+1. Swift companion loads `receiver.html` into a `WKWebView`.
+2. The page handles `RTCPeerConnection`, offer/answer, ICE, and remote track attachment.
+3. JS posts events (`ready`, `localIce`, `videoSize`, `streaming`, `connectionState`, `error`) to Swift through `window.webkit.messageHandlers.floatReceiverBridge`.
+4. Swift hosts that view controller inside private `PIP.framework` PiP (`PIPViewController`) and applies aspect ratio updates.
+5. PiP playback controls trigger Swift callbacks, which are sent back to extension as protocol `playback` messages.
+
+## End-to-end runtime flow
+
+1. Content scripts scan each frame for eligible `<video>` elements and publish `float:videos:update`.
+2. Service worker merges per-frame data into tab-level `state` and sends it to companion.
+3. Companion status item reflects source availability; selecting a source sends `start {tabId, videoId}`.
+4. Content script starts capture for that source, creates `RTCPeerConnection`, and sends `offer` + ICE.
+5. Companion receiver returns `answer`; both sides exchange ICE until connected.
+6. During active stream:
+   - service worker mutes the source tab and restores mute state on stop/error.
+   - companion can issue `playback {playing}` commands from PiP controls.
+   - content script applies `play()` / `pause()` on the active source element.
+7. On stop/disconnect/tab close, both sides tear down stream/signaling state and refresh availability.
 
 ## Build and run
 
 Extension:
 
 ```bash
-cd chrome
+cd /Users/maxnowack/code/float/chrome
 yarn install
 yarn build
 ```
@@ -43,15 +64,14 @@ yarn build
 Companion:
 
 ```bash
-xcodebuild -project companion/Float.xcodeproj -scheme Float -configuration Debug -sdk macosx build
+xcodebuild -project /Users/maxnowack/code/float/companion/Float.xcodeproj -scheme Float -configuration Debug -sdk macosx build
 ```
 
-Then load `chrome/` as an unpacked extension in Chromium and run the macOS app from Xcode/build output.
+Then load `/Users/maxnowack/code/float/chrome` as an unpacked extension and run the macOS app.
 
-## Important implementation notes
+## Notes and caveats
 
-- Signaling is local-only via `127.0.0.1:17891`.
-- Protocol version is currently `1` on both extension and companion.
-- The companion uses private `PIP.framework` APIs when available, with AVKit sample-buffer PiP fallback.
-- `NativeWebRTCReceiver.swift` contains extensive PiP/debug instrumentation; expect verbose logs when debug flags are enabled.
-- Pairing/auth hardening and allowlist work are tracked in milestone docs but not fully implemented.
+- Protocol version is `1` on both sides.
+- PiP uses private `PIP.framework` APIs; this is suitable for local/dev usage and may not be App Store-safe.
+- `receiver.html` must be present in the app bundle at runtime for the WK receiver to initialize.
+- Pairing/auth hardening is not implemented yet; signaling is trusted localhost.

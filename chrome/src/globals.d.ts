@@ -10,6 +10,8 @@ type FloatProtocolShape = {
     answer: "answer";
     ice: "ice";
     stop: "stop";
+    playback: "playback";
+    seek: "seek";
     error: "error";
     debug: "debug";
   };
@@ -21,6 +23,12 @@ declare var FloatProtocolIsStartMessage: (
   message: unknown,
 ) => message is { type: "start"; tabId: number; videoId: string };
 declare var FloatProtocolIsStopMessage: (message: unknown) => message is { type: "stop" };
+declare var FloatProtocolIsPlaybackMessage: (
+  message: unknown,
+) => message is { type: "playback"; tabId: number; videoId: string; playing: boolean };
+declare var FloatProtocolIsSeekMessage: (
+  message: unknown,
+) => message is { type: "seek"; tabId: number; videoId: string; intervalSeconds: number };
 declare var FloatProtocolIsAnswerMessage: (
   message: unknown,
 ) => message is { type: "answer"; tabId: number; videoId: string; sdp: string };

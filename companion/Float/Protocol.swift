@@ -11,6 +11,8 @@ enum FloatProtocol {
         static let answer = "answer"
         static let ice = "ice"
         static let stop = "stop"
+        static let playback = "playback"
+        static let seek = "seek"
         static let error = "error"
         static let debug = "debug"
     }
@@ -138,6 +140,8 @@ struct VideoState: Decodable, Identifiable {
     let playing: Bool?
     let muted: Bool?
     let resolution: String?
+    let currentTime: Double?
+    let duration: Double?
 
     var id: String { videoId }
 }
