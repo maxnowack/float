@@ -348,13 +348,16 @@ async function startStreaming(videoId: string): Promise<void> {
     return;
   }
 
-  if (stream.getVideoTracks().length === 0) {
+  const videoTracks = stream.getVideoTracks();
+  const audioTracks = stream.getAudioTracks();
+
+  if (videoTracks.length === 0) {
     notifyWebRTCError("captureStream returned no video track");
     stream.getTracks().forEach((track) => track.stop());
     return;
   }
 
-  const primaryVideoTrack = stream.getVideoTracks()[0];
+  const primaryVideoTrack = videoTracks[0];
   try {
     await primaryVideoTrack.applyConstraints({
       frameRate: { ideal: FLOAT_TARGET_FPS, max: FLOAT_TARGET_FPS },
@@ -369,7 +372,9 @@ async function startStreaming(videoId: string): Promise<void> {
   const trackSettings = primaryVideoTrack.getSettings();
   debugLog("source.track", {
     selectedVideoId,
-    streamTrackCount: stream.getVideoTracks().length,
+    streamTrackCount: stream.getTracks().length,
+    videoTrackCount: videoTracks.length,
+    audioTrackCount: audioTracks.length,
     trackId: primaryVideoTrack.id,
     width: trackSettings.width ?? null,
     height: trackSettings.height ?? null,
@@ -380,7 +385,8 @@ async function startStreaming(videoId: string): Promise<void> {
     iceServers: [],
   });
 
-  stream.getVideoTracks().forEach((track) => {
+  stream.getTracks().forEach((track) => {
+    track.enabled = true;
     peer.addTrack(track, stream);
   });
 

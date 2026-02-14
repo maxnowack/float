@@ -26,10 +26,18 @@ type TabState = {
   videos: WorkerVideoCandidate[];
 };
 
+type MutedTabState = {
+  tabId: number;
+  wasMuted: boolean;
+  didMuteTab: boolean;
+};
+
 const frameStateByTab = new Map<number, Map<string, FrameState>>();
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
 let activeStreamTarget: { tabId: number; videoId: string } | null = null;
+let mutedTabState: MutedTabState | null = null;
+let desiredMutedTabId: number | null = null;
 
 function log(message: string, payload?: unknown): void {
   if (!debugLogEnabled) {
@@ -101,6 +109,81 @@ function sendProtocolError(reason: string): void {
   sendSocketMessage(FloatProtocolError(reason));
 }
 
+function muteTabForStreaming(tabId: number): void {
+  desiredMutedTabId = tabId;
+
+  if (mutedTabState && mutedTabState.tabId === tabId) {
+    return;
+  }
+  if (mutedTabState && mutedTabState.tabId !== tabId) {
+    restoreMutedTabIfNeeded(mutedTabState.tabId);
+  }
+
+  chrome.tabs.get(tabId, (tab: any) => {
+    if (desiredMutedTabId !== tabId) {
+      return;
+    }
+
+    if (chrome.runtime.lastError) {
+      log("Failed to inspect tab mute state", chrome.runtime.lastError.message);
+      return;
+    }
+
+    const wasMuted = Boolean(tab?.mutedInfo?.muted);
+    mutedTabState = { tabId, wasMuted, didMuteTab: false };
+    if (wasMuted) {
+      return;
+    }
+
+    chrome.tabs.update(tabId, { muted: true }, () => {
+      if (chrome.runtime.lastError) {
+        log("Failed to mute tab", chrome.runtime.lastError.message);
+        return;
+      }
+      if (mutedTabState?.tabId === tabId) {
+        mutedTabState.didMuteTab = true;
+      }
+    });
+  });
+}
+
+function restoreMutedTabIfNeeded(tabId?: number): void {
+  if (!mutedTabState) {
+    return;
+  }
+  if (typeof tabId === "number" && mutedTabState.tabId !== tabId) {
+    return;
+  }
+  if (desiredMutedTabId === mutedTabState.tabId) {
+    return;
+  }
+
+  const state = mutedTabState;
+  mutedTabState = null;
+
+  if (state.wasMuted || !state.didMuteTab) {
+    return;
+  }
+
+  chrome.tabs.get(state.tabId, (tab: any) => {
+    if (chrome.runtime.lastError) {
+      return;
+    }
+
+    const mutedInfo = tab?.mutedInfo;
+    const currentlyMuted = Boolean(mutedInfo?.muted);
+    if (!currentlyMuted || mutedInfo?.reason === "user") {
+      return;
+    }
+
+    chrome.tabs.update(state.tabId, { muted: false }, () => {
+      if (chrome.runtime.lastError) {
+        log("Failed to restore tab mute state", chrome.runtime.lastError.message);
+      }
+    });
+  });
+}
+
 function flattenTabState(tabId: number): TabState | null {
   const frameMap = frameStateByTab.get(tabId);
   if (!frameMap || frameMap.size === 0) {
@@ -155,6 +238,8 @@ function onOfferFromContent(message: any, sender: any): void {
     return;
   }
 
+  muteTabForStreaming(tabId);
+
   sendSocketMessage({
     type: FloatProtocol.messageType.offer,
     tabId,
@@ -189,6 +274,16 @@ function onErrorFromContent(message: any, sender: any): void {
     videoId: typeof message.videoId === "string" ? message.videoId : null,
     reason,
   });
+
+  if (
+    activeStreamTarget &&
+    tabId === activeStreamTarget.tabId &&
+    (typeof message.videoId !== "string" || message.videoId === activeStreamTarget.videoId)
+  ) {
+    activeStreamTarget = null;
+    desiredMutedTabId = null;
+    restoreMutedTabIfNeeded(tabId);
+  }
 }
 
 function onDebugFromContent(message: any, sender: any): void {
@@ -283,6 +378,7 @@ function handleCompanionMessage(raw: unknown): void {
 
   if (FloatProtocolIsStartMessage(parsed)) {
     activeStreamTarget = { tabId: parsed.tabId, videoId: parsed.videoId };
+    desiredMutedTabId = parsed.tabId;
     chrome.tabs.sendMessage(parsed.tabId, {
       type: "float:start",
       videoId: parsed.videoId,
@@ -292,6 +388,8 @@ function handleCompanionMessage(raw: unknown): void {
 
   if (FloatProtocolIsStopMessage(parsed)) {
     activeStreamTarget = null;
+    desiredMutedTabId = null;
+    restoreMutedTabIfNeeded();
     chrome.tabs.query({}, (tabs: any[]) => {
       tabs.forEach((tab) => {
         if (typeof tab.id === "number") {
@@ -371,6 +469,10 @@ chrome.runtime.onMessage.addListener((message: any, sender: any) => {
     ) {
       activeStreamTarget = null;
     }
+    if (sender?.tab?.id === mutedTabState?.tabId) {
+      desiredMutedTabId = activeStreamTarget?.tabId ?? null;
+      restoreMutedTabIfNeeded(sender.tab.id);
+    }
     sendSocketMessage({
       type: FloatProtocol.messageType.stop,
     });
@@ -384,6 +486,10 @@ chrome.runtime.onMessage.addListener((message: any, sender: any) => {
 
 chrome.tabs.onRemoved.addListener((tabId: number) => {
   frameStateByTab.delete(tabId);
+  if (mutedTabState?.tabId === tabId) {
+    mutedTabState = null;
+    desiredMutedTabId = null;
+  }
   sendState();
 });
 

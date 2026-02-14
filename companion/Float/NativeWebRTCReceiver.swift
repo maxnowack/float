@@ -17,6 +17,7 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
     private var currentTabId: Int?
     private var currentVideoId: String?
     private var currentVideoTrack: RTCVideoTrack?
+    private var currentAudioTrack: RTCAudioTrack?
     private let pipController = NativePiPController()
     private let sampleBufferRenderer = WebRTCSampleBufferRenderer()
     private let sampleDeliveryLock = NSLock()
@@ -69,6 +70,8 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
             track.remove(sampleBufferRenderer)
         }
         currentVideoTrack = nil
+        currentAudioTrack = nil
+        sampleBufferRenderer.resetTiming()
         sampleBufferRenderer.onSampleBuffer = nil
         sampleBufferRenderer.shouldSkipFrameBeforeConversion = nil
         onStreamingChanged?(false)
@@ -117,7 +120,7 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
         try await withCheckedThrowingContinuation { continuation in
             let constraints = RTCMediaConstraints(
                 mandatoryConstraints: [
-                    "OfferToReceiveAudio": "false",
+                    "OfferToReceiveAudio": "true",
                     "OfferToReceiveVideo": "true",
                 ],
                 optionalConstraints: nil
@@ -184,6 +187,8 @@ extension NativeWebRTCReceiver: RTCPeerConnectionDelegate {
     func peerConnection(_ peerConnection: RTCPeerConnection, didStartReceivingOn transceiver: RTCRtpTransceiver) {
         if let track = transceiver.receiver.track as? RTCVideoTrack {
             attachVideoTrack(track)
+        } else if let track = transceiver.receiver.track as? RTCAudioTrack {
+            attachAudioTrack(track)
         }
     }
 
@@ -194,15 +199,21 @@ extension NativeWebRTCReceiver: RTCPeerConnectionDelegate {
     ) {
         if let track = rtpReceiver.track as? RTCVideoTrack {
             attachVideoTrack(track)
+        } else if let track = rtpReceiver.track as? RTCAudioTrack {
+            attachAudioTrack(track)
         }
     }
 }
 
 private extension NativeWebRTCReceiver {
     func attachVideoTrack(_ track: RTCVideoTrack) {
-        if let previous = currentVideoTrack, previous.trackId != track.trackId {
+        if let previous = currentVideoTrack, previous.trackId == track.trackId {
+            return
+        }
+        if let previous = currentVideoTrack {
             previous.remove(sampleBufferRenderer)
         }
+        sampleBufferRenderer.resetTiming()
         if pipDebugLoggingEnabled {
             let videoID = currentVideoId ?? "unknown-video"
             sampleBufferRenderer.streamLabel = "\(videoID):\(track.trackId)"
@@ -218,6 +229,15 @@ private extension NativeWebRTCReceiver {
         onStreamingChanged?(true)
         Task { @MainActor in
             self.pipController.requestStart()
+        }
+    }
+
+    func attachAudioTrack(_ track: RTCAudioTrack) {
+        currentAudioTrack = track
+        track.isEnabled = true
+        if pipDebugLoggingEnabled {
+            let videoID = currentVideoId ?? "unknown-video"
+            print("[Float PiP] receiver.audio-attached video=\(videoID) track=\(track.trackId)")
         }
     }
 
@@ -271,6 +291,10 @@ private extension NativeWebRTCReceiver {
 
 private final class WebRTCSampleBufferRenderer: NSObject, RTCVideoRenderer {
     private typealias PixelBufferResult = (buffer: CVPixelBuffer, usedCropScale: Bool)
+    private static let videoTimestampTimescale: Int32 = 1_000_000_000
+    private static let minimumFrameStep = CMTime(value: 1, timescale: 240)
+    private static let videoPlayoutDelay = CMTime(value: 120, timescale: 1_000) // 120ms
+
     private struct FormatKey: Equatable {
         let width: Int
         let height: Int
@@ -282,6 +306,8 @@ private final class WebRTCSampleBufferRenderer: NSObject, RTCVideoRenderer {
     var shouldSkipFrameBeforeConversion: (() -> Bool)?
     var streamLabel: String = "stream"
     private var lastPresentationTime = CMTime.invalid
+    private var firstFrameTimestampNs: Int64?
+    private var firstFramePresentationTime = CMTime.invalid
     private var renderedFrameCount: Int = 0
     private var droppedFrameCount: Int = 0
     private let formatCacheLock = NSLock()
@@ -317,7 +343,7 @@ private final class WebRTCSampleBufferRenderer: NSObject, RTCVideoRenderer {
             return
         }
         let pixelBuffer = pixelBufferResult.buffer
-        guard let sampleBuffer = makeSampleBuffer(from: pixelBuffer, presentationTime: nextPresentationTime()) else {
+        guard let sampleBuffer = makeSampleBuffer(from: pixelBuffer, presentationTime: presentationTime(for: frame)) else {
             droppedFrameCount += 1
             if pipDebugLoggingEnabled, droppedFrameCount % 30 == 0 {
                 print("[Float PiP] renderer.drop stream=\(streamLabel) reason=sample-buffer-create frame=\(renderedFrameCount)")
@@ -450,21 +476,48 @@ private final class WebRTCSampleBufferRenderer: NSObject, RTCVideoRenderer {
         return formatDescription
     }
 
-    private func nextPresentationTime() -> CMTime {
+    func resetTiming() {
+        lastPresentationTime = .invalid
+        firstFrameTimestampNs = nil
+        firstFramePresentationTime = .invalid
+    }
+
+    private func presentationTime(for frame: RTCVideoFrame) -> CMTime {
         let now = CMClockGetTime(CMClockGetHostTimeClock())
+        let frameTimestampNs = frame.timeStampNs
+
+        guard frameTimestampNs > 0 else {
+            return monotonicPresentationTime(from: now)
+        }
+
+        if firstFrameTimestampNs == nil || !firstFramePresentationTime.isValid {
+            firstFrameTimestampNs = frameTimestampNs
+            firstFramePresentationTime = CMTimeAdd(now, Self.videoPlayoutDelay)
+        }
+
+        guard let firstFrameTimestampNs else {
+            return monotonicPresentationTime(from: now)
+        }
+
+        let frameDeltaNs = max(Int64(0), frameTimestampNs - firstFrameTimestampNs)
+        let delta = CMTime(value: frameDeltaNs, timescale: Self.videoTimestampTimescale)
+        let mapped = CMTimeAdd(firstFramePresentationTime, delta)
+        return monotonicPresentationTime(from: mapped)
+    }
+
+    private func monotonicPresentationTime(from candidate: CMTime) -> CMTime {
+        var presentationTime = candidate
         if !lastPresentationTime.isValid {
-            lastPresentationTime = now
-            return now
+            lastPresentationTime = presentationTime
+            return presentationTime
         }
 
-        if now <= lastPresentationTime {
-            let advanced = CMTimeAdd(lastPresentationTime, CMTime(value: 1, timescale: 240))
-            lastPresentationTime = advanced
-            return advanced
+        if presentationTime <= lastPresentationTime {
+            presentationTime = CMTimeAdd(lastPresentationTime, Self.minimumFrameStep)
         }
 
-        lastPresentationTime = now
-        return now
+        lastPresentationTime = presentationTime
+        return presentationTime
     }
 
     private static func makePixelBuffer(width: Int, height: Int, pixelFormat: OSType) -> CVPixelBuffer? {
