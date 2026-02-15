@@ -16,6 +16,7 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
     private let pipController = NativePiPController()
     private var currentTabId: Int?
     private var currentVideoId: String?
+    private var isStopping = false
 
     private var bridgeReady = false
     private lazy var messageHandlerProxy = WeakScriptMessageHandler(delegate: self)
@@ -85,6 +86,10 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     func stop() {
+        guard !isStopping else { return }
+        isStopping = true
+        defer { isStopping = false }
+
         currentTabId = nil
         currentVideoId = nil
         onStreamingChanged?(false)
@@ -230,6 +235,7 @@ private final class NativePiPController: NSObject {
     private var privatePiPPanelKVOContext = 0
     private var privatePiPPlayingKVOContext = 0
     private var isUpdatingPlaybackStateProgrammatically = false
+    private var suppressPlaybackCommands = false
     private var defaultPrivatePiPControls: UInt64 = 3
     private var defaultPrivatePiPControlStyle: Int = 1
     private var playbackElapsedSeconds: Double = 0
@@ -259,11 +265,13 @@ private final class NativePiPController: NSObject {
     }
 
     func requestStart() {
+        suppressPlaybackCommands = false
         wantsStart = true
         attemptStartPiP()
     }
 
     func stop() {
+        suppressPlaybackCommands = true
         wantsStart = false
         isStartingPictureInPicture = false
 
@@ -687,7 +695,12 @@ private final class NativePiPController: NSObject {
         if callVoidMethod(on: controller, selectorName: "stopPictureInPicture") {
             return true
         }
-        if callObjectSetter(on: controller, selectorName: "dismissPictureInPictureWithCompletionHandler:", value: nil) {
+        let completion: @convention(block) () -> Void = {}
+        if callObjectSetter(
+            on: controller,
+            selectorName: "dismissPictureInPictureWithCompletionHandler:",
+            value: unsafeBitCast(completion, to: AnyObject.self)
+        ) {
             return true
         }
         return false
@@ -697,12 +710,14 @@ private final class NativePiPController: NSObject {
         privatePiPPresented = isPresented
 
         if isPresented {
+            suppressPlaybackCommands = false
             startPrivatePiPPanelObservation()
             startPrivatePiPVisibilityWatchdog()
             refreshPrivatePiPPanelFromController()
             return
         }
 
+        suppressPlaybackCommands = true
         stopPrivatePiPVisibilityWatchdog()
         stopPrivatePiPPanelObservation()
         if notifyExternalClose {
@@ -813,6 +828,7 @@ private final class NativePiPController: NSObject {
     ) {
         if context == &privatePiPPlayingKVOContext {
             guard !isUpdatingPlaybackStateProgrammatically else { return }
+            guard !suppressPlaybackCommands else { return }
             guard let controller = privatePiPController else { return }
             guard let isPlaying = callBoolGetter(on: controller, selectorName: "playing") else { return }
             onPlaybackCommand?(isPlaying)
@@ -856,6 +872,7 @@ private final class NativePiPController: NSObject {
     @objc(clientPIP:willCloseWithCompletion:)
     func clientPIP(_ pipID: UInt32, willCloseWithCompletion completion: @escaping () -> Void) {
         _ = pipID
+        suppressPlaybackCommands = true
         completion()
     }
 
@@ -900,10 +917,11 @@ private final class NativePiPController: NSObject {
     @objc(pipActionStop:)
     func pipActionStop(_ pip: Any?) {
         _ = pip
-        forwardPlaybackCommand(isPlaying: false)
+        suppressPlaybackCommands = true
     }
 
     private func forwardPlaybackCommand(isPlaying: Bool) {
+        guard !suppressPlaybackCommands else { return }
         updatePlaybackClock(isPlaying: isPlaying)
         pushPlaybackStateToPiPController()
         onPlaybackCommand?(isPlaying)

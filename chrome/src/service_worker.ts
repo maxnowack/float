@@ -111,6 +111,26 @@ function sendProtocolError(reason: string): void {
   sendSocketMessage(FloatProtocolError(reason));
 }
 
+function unmuteTabIfNeeded(tabId: number): void {
+  chrome.tabs.get(tabId, (tab: any) => {
+    if (chrome.runtime.lastError) {
+      return;
+    }
+
+    const mutedInfo = tab?.mutedInfo;
+    const currentlyMuted = Boolean(mutedInfo?.muted);
+    if (!currentlyMuted || mutedInfo?.reason === "user") {
+      return;
+    }
+
+    chrome.tabs.update(tabId, { muted: false }, () => {
+      if (chrome.runtime.lastError) {
+        log("Failed to restore tab mute state", chrome.runtime.lastError.message);
+      }
+    });
+  });
+}
+
 function muteTabForStreaming(tabId: number): void {
   desiredMutedTabId = tabId;
 
@@ -140,10 +160,20 @@ function muteTabForStreaming(tabId: number): void {
     chrome.tabs.update(tabId, { muted: true }, () => {
       if (chrome.runtime.lastError) {
         log("Failed to mute tab", chrome.runtime.lastError.message);
+        if (mutedTabState?.tabId === tabId) {
+          mutedTabState = null;
+        }
         return;
       }
       if (mutedTabState?.tabId === tabId) {
         mutedTabState.didMuteTab = true;
+        if (desiredMutedTabId !== tabId) {
+          restoreMutedTabIfNeeded(tabId);
+        }
+        return;
+      }
+      if (desiredMutedTabId !== tabId) {
+        unmuteTabIfNeeded(tabId);
       }
     });
   });
@@ -161,29 +191,16 @@ function restoreMutedTabIfNeeded(tabId?: number): void {
   }
 
   const state = mutedTabState;
-  mutedTabState = null;
-
-  if (state.wasMuted || !state.didMuteTab) {
+  if (state.wasMuted) {
+    mutedTabState = null;
+    return;
+  }
+  if (!state.didMuteTab) {
     return;
   }
 
-  chrome.tabs.get(state.tabId, (tab: any) => {
-    if (chrome.runtime.lastError) {
-      return;
-    }
-
-    const mutedInfo = tab?.mutedInfo;
-    const currentlyMuted = Boolean(mutedInfo?.muted);
-    if (!currentlyMuted || mutedInfo?.reason === "user") {
-      return;
-    }
-
-    chrome.tabs.update(state.tabId, { muted: false }, () => {
-      if (chrome.runtime.lastError) {
-        log("Failed to restore tab mute state", chrome.runtime.lastError.message);
-      }
-    });
-  });
+  mutedTabState = null;
+  unmuteTabIfNeeded(state.tabId);
 }
 
 function flattenTabState(tabId: number): TabState | null {

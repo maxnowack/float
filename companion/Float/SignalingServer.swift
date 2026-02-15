@@ -85,6 +85,7 @@ final class SignalingServer: ObservableObject {
     private let webRTCReceiver: WebRTCReceiver
     private var activeTabId: Int?
     private var activeVideoId: String?
+    private var stopRequestInFlight = false
 
     init() {
         var receiver = makeWebRTCReceiver()
@@ -105,10 +106,7 @@ final class SignalingServer: ObservableObject {
         }
         receiver.onStreamingChanged = { [weak self] isStreaming in
             Task { @MainActor [weak self] in
-                if protocolDebugLoggingEnabled {
-                    print("[Float Signal] receiver.onStreamingChanged value=\(isStreaming)")
-                }
-                self?.isStreaming = isStreaming
+                self?.handleReceiverStreamingChanged(isStreaming)
             }
         }
         receiver.onPlaybackCommand = { [weak self] isPlaying in
@@ -177,6 +175,7 @@ final class SignalingServer: ObservableObject {
     }
 
     func requestStart(tabId: Int, videoId: String) {
+        stopRequestInFlight = false
         activeTabId = tabId
         activeVideoId = videoId
         webRTCReceiver.updatePlaybackState(isPlaying: true)
@@ -193,10 +192,14 @@ final class SignalingServer: ObservableObject {
         if protocolDebugLoggingEnabled {
             print("[Float Signal] requestStop called")
         }
-        webRTCReceiver.stop()
+        if stopRequestInFlight {
+            return
+        }
+        stopRequestInFlight = true
         isStreaming = false
         activeTabId = nil
         activeVideoId = nil
+        webRTCReceiver.stop()
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])
     }
 
@@ -314,7 +317,11 @@ final class SignalingServer: ObservableObject {
                     self.syncReceiverPlaybackStateFromTabs()
                 }
             case FloatProtocol.MessageType.stop:
-                webRTCReceiver.stop()
+                let shouldStopReceiver = !stopRequestInFlight
+                stopRequestInFlight = false
+                if shouldStopReceiver {
+                    webRTCReceiver.stop()
+                }
                 Task { @MainActor in
                     self.isStreaming = false
                     self.activeTabId = nil
@@ -353,6 +360,33 @@ final class SignalingServer: ObservableObject {
         } catch {
             sendError("Invalid message: \(error.localizedDescription)", to: clientID)
         }
+    }
+
+    private func handleReceiverStreamingChanged(_ isStreaming: Bool) {
+        if protocolDebugLoggingEnabled {
+            print("[Float Signal] receiver.onStreamingChanged value=\(isStreaming)")
+        }
+
+        let wasStreaming = self.isStreaming
+        self.isStreaming = isStreaming
+        if isStreaming {
+            stopRequestInFlight = false
+        }
+        guard wasStreaming && !isStreaming else {
+            return
+        }
+
+        guard activeTabId != nil, activeVideoId != nil else {
+            return
+        }
+        guard !stopRequestInFlight else {
+            return
+        }
+
+        activeTabId = nil
+        activeVideoId = nil
+        stopRequestInFlight = true
+        sendToAnyClient(["type": FloatProtocol.MessageType.stop])
     }
 
     private func sendToAnyClient(_ payload: [String: Any]) {
@@ -441,6 +475,7 @@ final class SignalingServer: ObservableObject {
 
     private func handleOffer(_ offer: OfferMessage, clientID: UUID) async {
         do {
+            stopRequestInFlight = false
             activeTabId = offer.tabId
             activeVideoId = offer.videoId
             let answerSDP = try await webRTCReceiver.handleOffer(offer)

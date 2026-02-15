@@ -416,6 +416,10 @@ async function startStreaming(videoId: string): Promise<void> {
   };
 
   peer.onconnectionstatechange = () => {
+    if (peer.connectionState === "disconnected") {
+      stopStreaming();
+      return;
+    }
     if (peer.connectionState === "failed" || peer.connectionState === "closed") {
       notifyWebRTCError(`Peer state changed to ${peer.connectionState}`);
     }
