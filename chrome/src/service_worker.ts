@@ -79,6 +79,7 @@ function connectToCompanion(): void {
 
   socket.addEventListener("close", () => {
     log("Companion socket closed");
+    stopStreamingAfterCompanionDisconnect();
     socket = null;
     scheduleReconnect();
   });
@@ -86,6 +87,24 @@ function connectToCompanion(): void {
   socket.addEventListener("error", () => {
     log("Companion socket error");
     socket?.close();
+  });
+}
+
+function stopStreamingAfterCompanionDisconnect(): void {
+  if (!activeStreamTarget && !mutedTabState) {
+    return;
+  }
+
+  activeStreamTarget = null;
+  desiredMutedTabId = null;
+  restoreMutedTabIfNeeded();
+
+  chrome.tabs.query({}, (tabs: any[]) => {
+    tabs.forEach((tab) => {
+      if (typeof tab.id === "number") {
+        chrome.tabs.sendMessage(tab.id, { type: "float:stop" });
+      }
+    });
   });
 }
 
