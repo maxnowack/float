@@ -78,18 +78,12 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func handlePrimaryClick() {
-        let sources = signalingServer.availableSources
         if signalingServer.isStreaming {
-            if sources.count == 1, let source = sources.first, signalingServer.isActiveSource(source) {
-                return
-            }
-            guard sources.count > 1 else {
-                return
-            }
-            presentSourceMenu(sources)
+            signalingServer.requestStop()
             return
         }
 
+        let sources = signalingServer.availableSources
         if sources.count == 1, let source = sources.first {
             startFloating(source)
             return
@@ -129,12 +123,6 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
     private func presentQuitMenu() {
         let menu = NSMenu()
-        if signalingServer.isStreaming {
-            let stopItem = NSMenuItem(title: "Stop Floating", action: #selector(handleStopRequested), keyEquivalent: "")
-            stopItem.target = self
-            menu.addItem(stopItem)
-            menu.addItem(.separator())
-        }
 
         let autoStartItem = NSMenuItem(
             title: "Auto-start PiP",
