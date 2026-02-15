@@ -19,6 +19,7 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
     private var isStopping = false
 
     private var bridgeReady = false
+    private var debugLoggingEnabled = false
     private lazy var messageHandlerProxy = WeakScriptMessageHandler(delegate: self)
 
     override init() {
@@ -106,6 +107,11 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
         pipController.updatePlaybackProgress(elapsedSeconds: elapsedSeconds, durationSeconds: durationSeconds)
     }
 
+    func setDebugLoggingEnabled(_ enabled: Bool) {
+        debugLoggingEnabled = enabled
+        applyDebugLoggingSettingToPage()
+    }
+
     private func waitForBridgeReady() async throws {
         if bridgeReady {
             return
@@ -122,6 +128,37 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
 
     private func markBridgeReady() {
         bridgeReady = true
+        applyDebugLoggingSettingToPage()
+    }
+
+    private func applyDebugLoggingSettingToPage() {
+        let enabled = debugLoggingEnabled ? "true" : "false"
+        pipController.webView.evaluateJavaScript(
+            "window.FloatReceiver && window.FloatReceiver.setDebugLoggingEnabled(\(enabled));",
+            completionHandler: nil
+        )
+    }
+
+    private func formatDebugPayload(_ payload: Any?) -> String {
+        guard let payload else {
+            return "{}"
+        }
+
+        if let text = payload as? String {
+            return text
+        }
+
+        if let number = payload as? NSNumber {
+            return number.stringValue
+        }
+
+        if JSONSerialization.isValidJSONObject(payload),
+           let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+           let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+
+        return String(describing: payload)
     }
 
     private func handleScriptMessage(_ body: Any) {
@@ -134,7 +171,9 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
             markBridgeReady()
             let secure = (payload["isSecureContext"] as? Bool) ?? false
             let hasRTCPeerConnection = (payload["hasRTCPeerConnection"] as? Bool) ?? false
-            print("[Float WK] receiver.ready secure=\(secure) hasRTCPeerConnection=\(hasRTCPeerConnection)")
+            if debugLoggingEnabled {
+                print("[Float WK] receiver.ready secure=\(secure) hasRTCPeerConnection=\(hasRTCPeerConnection)")
+            }
         case "localIce":
             guard
                 let tabId = currentTabId,
@@ -175,6 +214,11 @@ final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
         case "error":
             let reason = (payload["reason"] as? String) ?? "unknown"
             print("[Float WK] receiver.error \(reason)")
+        case "debug":
+            guard debugLoggingEnabled else { return }
+            let event = (payload["event"] as? String) ?? "unknown"
+            let debugPayload = formatDebugPayload(payload["payload"])
+            print("[Float WK JS] \(event) payload=\(debugPayload)")
         default:
             break
         }

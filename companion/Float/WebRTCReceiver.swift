@@ -18,6 +18,13 @@ protocol WebRTCReceiver {
     func stop()
     func updatePlaybackState(isPlaying: Bool)
     func updatePlaybackProgress(elapsedSeconds: Double?, durationSeconds: Double?)
+    func setDebugLoggingEnabled(_ enabled: Bool)
+}
+
+extension WebRTCReceiver {
+    func setDebugLoggingEnabled(_ enabled: Bool) {
+        _ = enabled
+    }
 }
 
 enum WebRTCReceiverError: LocalizedError {

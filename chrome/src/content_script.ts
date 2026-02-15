@@ -20,10 +20,15 @@ let activeStream: MediaStream | null = null;
 let activeVideoId: string | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let sourceProbeTimerId: number | null = null;
+let senderStatsTimerId: number | null = null;
 let didNotifyBackgroundSinceForeground = false;
-const FLOAT_TARGET_WIDTH = 1280;
-const FLOAT_TARGET_HEIGHT = 720;
-const FLOAT_TARGET_FPS = 30;
+const FLOAT_MAX_VIDEO_FPS = 60;
+const FLOAT_VIDEO_MAX_BITRATE_BPS = 25_000_000;
+const FLOAT_AUDIO_MAX_BITRATE_BPS = 320_000;
+const FLOAT_MAX_VIDEO_WIDTH = 1280;
+const FLOAT_MAX_VIDEO_HEIGHT = 720;
+const FLOAT_VIDEO_CODEC_PRIORITY = ["video/H264", "video/VP8", "video/VP9", "video/AV1"] as const;
+const FLOAT_AUDIO_CODEC_PRIORITY = ["audio/opus", "audio/ISAC", "audio/G722", "audio/PCMU", "audio/PCMA"] as const;
 const isTopFrame = (() => {
   try {
     return window.top === window;
@@ -372,8 +377,407 @@ function startSourceProbe(video: HTMLVideoElement, selectedVideoId: string): voi
   }, 2000);
 }
 
+function codecPriorityIndex(mimeType: string, preferredCodecs: readonly string[]): number {
+  const normalizedMimeType = mimeType.toLowerCase();
+  const index = preferredCodecs.findIndex((codec) => codec.toLowerCase() === normalizedMimeType);
+  return index === -1 ? preferredCodecs.length : index;
+}
+
+function computeScaleResolutionDownBy(
+  width: number | undefined,
+  height: number | undefined,
+): number {
+  const safeWidth = typeof width === "number" && Number.isFinite(width) && width > 0 ? width : 0;
+  const safeHeight = typeof height === "number" && Number.isFinite(height) && height > 0 ? height : 0;
+  if (safeWidth <= 0 || safeHeight <= 0) {
+    return 1;
+  }
+
+  const widthScale = safeWidth / FLOAT_MAX_VIDEO_WIDTH;
+  const heightScale = safeHeight / FLOAT_MAX_VIDEO_HEIGHT;
+  const requiredScale = Math.max(1, widthScale, heightScale);
+  if (!Number.isFinite(requiredScale) || requiredScale <= 1) {
+    return 1;
+  }
+
+  // Keep a stable, bounded precision for browser encoder parameters.
+  return Math.round(requiredScale * 1000) / 1000;
+}
+
+function appendSdpFmtpParameter(line: string, key: string, value: string): string {
+  const prefixEnd = line.indexOf(" ");
+  if (prefixEnd < 0) {
+    return line;
+  }
+  const prefix = line.slice(0, prefixEnd + 1);
+  const rawValue = line.slice(prefixEnd + 1);
+  const segments = rawValue
+    .split(";")
+    .map((segment) => segment.trim())
+    .filter((segment) => segment.length > 0);
+  const target = `${key}=${value}`;
+  const keyPrefix = `${key}=`;
+  const existingIndex = segments.findIndex((segment) => segment.toLowerCase().startsWith(keyPrefix.toLowerCase()));
+  if (existingIndex >= 0) {
+    segments[existingIndex] = target;
+  } else {
+    segments.push(target);
+  }
+  return `${prefix}${segments.join(";")}`;
+}
+
+function enforceStereoOpusInOfferSdp(offerSdp: string, selectedVideoId: string): string {
+  const lines = offerSdp.split("\r\n");
+  const opusPayloadTypes = new Set<string>();
+
+  lines.forEach((line) => {
+    const match = /^a=rtpmap:(\d+)\s+opus\/48000\/2$/i.exec(line);
+    if (match?.[1]) {
+      opusPayloadTypes.add(match[1]);
+    }
+  });
+
+  if (opusPayloadTypes.size === 0) {
+    return offerSdp;
+  }
+
+  let updated = false;
+  const transformed = lines.map((line) => {
+    const match = /^a=fmtp:(\d+)\s+/i.exec(line);
+    if (!match?.[1] || !opusPayloadTypes.has(match[1])) {
+      return line;
+    }
+    updated = true;
+    let next = appendSdpFmtpParameter(line, "stereo", "1");
+    next = appendSdpFmtpParameter(next, "sprop-stereo", "1");
+    return next;
+  });
+
+  if (!updated) {
+    const mutable = [...transformed];
+    const opusPayloadType = Array.from(opusPayloadTypes)[0];
+    for (let index = 0; index < mutable.length; index += 1) {
+      const line = mutable[index];
+      if (new RegExp(`^a=rtpmap:${opusPayloadType}\\s+opus/48000/2$`, "i").test(line)) {
+        mutable.splice(index + 1, 0, `a=fmtp:${opusPayloadType} stereo=1;sprop-stereo=1`);
+        updated = true;
+        break;
+      }
+    }
+    if (updated) {
+      debugLog("sender.opusStereo.sdpUpdated", {
+        selectedVideoId,
+        mode: "inserted-fmtp",
+      });
+      return mutable.join("\r\n");
+    }
+  }
+
+  if (updated) {
+    debugLog("sender.opusStereo.sdpUpdated", {
+      selectedVideoId,
+      mode: "updated-fmtp",
+    });
+  }
+
+  return transformed.join("\r\n");
+}
+
+function extractOpusFmtpLinesFromSdp(sdp: string): string[] {
+  const lines = sdp.split("\r\n");
+  const opusPayloadTypes = new Set<string>();
+  lines.forEach((line) => {
+    const match = /^a=rtpmap:(\d+)\s+opus\/48000\/2$/i.exec(line);
+    if (match?.[1]) {
+      opusPayloadTypes.add(match[1]);
+    }
+  });
+
+  const opusFmtpLines: string[] = [];
+  lines.forEach((line) => {
+    const match = /^a=fmtp:(\d+)\s+/i.exec(line);
+    if (!match?.[1] || !opusPayloadTypes.has(match[1])) {
+      return;
+    }
+    opusFmtpLines.push(line);
+  });
+
+  return opusFmtpLines;
+}
+
+function logAudioTrackDiagnostics(selectedVideoId: string, audioTracks: MediaStreamTrack[]): void {
+  const primaryAudioTrack = audioTracks[0];
+  if (!primaryAudioTrack) {
+    debugLog("source.track.audio.missing", { selectedVideoId });
+    return;
+  }
+
+  let capabilities: MediaTrackCapabilities | null = null;
+  try {
+    capabilities = primaryAudioTrack.getCapabilities();
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "getCapabilities failed";
+    debugLog("source.track.audioCapabilities.failed", {
+      selectedVideoId,
+      reason,
+    });
+  }
+
+  debugLog("source.track.audio", {
+    selectedVideoId,
+    trackId: primaryAudioTrack.id,
+    label: primaryAudioTrack.label,
+    enabled: primaryAudioTrack.enabled,
+    muted: primaryAudioTrack.muted,
+    readyState: primaryAudioTrack.readyState,
+    settings: primaryAudioTrack.getSettings(),
+    constraints: primaryAudioTrack.getConstraints(),
+    capabilities,
+  });
+}
+
+function startSenderStatsProbe(peer: RTCPeerConnection, selectedVideoId: string): void {
+  if (senderStatsTimerId !== null) {
+    window.clearInterval(senderStatsTimerId);
+    senderStatsTimerId = null;
+  }
+
+  let inFlight = false;
+  senderStatsTimerId = window.setInterval(() => {
+    if (inFlight) {
+      return;
+    }
+    inFlight = true;
+
+    void peer
+      .getStats()
+      .then((stats) => {
+        const codecById = new Map<string, RTCStats>();
+        const sourceById = new Map<string, RTCStats>();
+
+        stats.forEach((item) => {
+          if (item.type === "codec") {
+            codecById.set(item.id, item);
+            return;
+          }
+          if (item.type === "media-source" || item.type === "track") {
+            sourceById.set(item.id, item);
+          }
+        });
+
+        const reports: Record<string, unknown>[] = [];
+        stats.forEach((item) => {
+          const outbound = item as RTCStats & Record<string, unknown>;
+          if (outbound.type !== "outbound-rtp") {
+            return;
+          }
+          if (outbound.isRemote === true) {
+            return;
+          }
+          const kind = (outbound.kind ?? outbound.mediaType) as string | undefined;
+          if (kind !== "audio") {
+            return;
+          }
+
+          const codecId = typeof outbound.codecId === "string" ? outbound.codecId : null;
+          const codec = codecId ? (codecById.get(codecId) as Record<string, unknown> | undefined) : undefined;
+          const mediaSourceId =
+            typeof outbound.mediaSourceId === "string" ? (outbound.mediaSourceId as string) : null;
+          const mediaSource = mediaSourceId
+            ? (sourceById.get(mediaSourceId) as Record<string, unknown> | undefined)
+            : undefined;
+
+          reports.push({
+            id: outbound.id,
+            timestamp: outbound.timestamp,
+            bytesSent: outbound.bytesSent ?? null,
+            packetsSent: outbound.packetsSent ?? null,
+            headerBytesSent: outbound.headerBytesSent ?? null,
+            retransmittedPacketsSent: outbound.retransmittedPacketsSent ?? null,
+            codecMimeType: codec?.mimeType ?? null,
+            codecClockRate: codec?.clockRate ?? null,
+            codecChannels: codec?.channels ?? null,
+            codecSdpFmtpLine: codec?.sdpFmtpLine ?? null,
+            mediaSourceAudioLevel: mediaSource?.audioLevel ?? null,
+            mediaSourceTotalAudioEnergy: mediaSource?.totalAudioEnergy ?? null,
+            mediaSourceTotalSamplesDuration: mediaSource?.totalSamplesDuration ?? null,
+          });
+        });
+
+        if (reports.length > 0) {
+          debugLog("sender.stats.audio", {
+            selectedVideoId,
+            reports,
+          });
+        }
+      })
+      .catch((error) => {
+        const reason = error instanceof Error ? error.message : "getStats failed";
+        debugLog("sender.stats.audio.failed", {
+          selectedVideoId,
+          reason,
+        });
+      })
+      .finally(() => {
+        inFlight = false;
+      });
+  }, 5000);
+}
+
+function stopSenderStatsProbe(): void {
+  if (senderStatsTimerId !== null) {
+    window.clearInterval(senderStatsTimerId);
+    senderStatsTimerId = null;
+  }
+}
+
+function applyCodecPreferences(
+  peer: RTCPeerConnection,
+  sender: RTCRtpSender,
+  selectedVideoId: string,
+): void {
+  const kind = sender.track?.kind;
+  if (kind !== "audio" && kind !== "video") {
+    return;
+  }
+
+  const transceiver = peer.getTransceivers().find((candidate) => candidate.sender === sender);
+  if (!transceiver || typeof transceiver.setCodecPreferences !== "function") {
+    return;
+  }
+
+  const capabilities = RTCRtpSender.getCapabilities?.(kind);
+  const codecs = capabilities?.codecs;
+  if (!codecs || codecs.length === 0) {
+    return;
+  }
+
+  const preferredCodecs = kind === "video" ? FLOAT_VIDEO_CODEC_PRIORITY : FLOAT_AUDIO_CODEC_PRIORITY;
+  const sortedCodecs = [...codecs].sort((left, right) => {
+    return codecPriorityIndex(left.mimeType, preferredCodecs) - codecPriorityIndex(right.mimeType, preferredCodecs);
+  });
+
+  try {
+    transceiver.setCodecPreferences(sortedCodecs);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "setCodecPreferences failed";
+    debugLog("sender.codecPreferences.failed", {
+      selectedVideoId,
+      kind,
+      reason,
+    });
+  }
+}
+
+async function applyTrackQualitySettings(
+  selectedVideoId: string,
+  videoTrack: MediaStreamTrack,
+  audioTracks: MediaStreamTrack[],
+): Promise<void> {
+  try {
+    videoTrack.contentHint = "motion";
+  } catch {
+    // Ignore unsupported contentHint.
+  }
+
+  try {
+    await videoTrack.applyConstraints({
+      width: { max: FLOAT_MAX_VIDEO_WIDTH, ideal: FLOAT_MAX_VIDEO_WIDTH },
+      height: { max: FLOAT_MAX_VIDEO_HEIGHT, ideal: FLOAT_MAX_VIDEO_HEIGHT },
+      frameRate: { ideal: FLOAT_MAX_VIDEO_FPS },
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "video applyConstraints failed";
+    debugLog("source.track.videoConstraints.failed", {
+      selectedVideoId,
+      reason,
+    });
+  }
+
+  const primaryAudioTrack = audioTracks[0];
+  if (!primaryAudioTrack) {
+    return;
+  }
+
+  try {
+    primaryAudioTrack.contentHint = "music";
+  } catch {
+    // Ignore unsupported contentHint.
+  }
+
+  try {
+    await primaryAudioTrack.applyConstraints({
+      autoGainControl: false,
+      echoCancellation: false,
+      noiseSuppression: false,
+      channelCount: { ideal: 2 },
+      sampleRate: { ideal: 48000 },
+    });
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "audio applyConstraints failed";
+    debugLog("source.track.audioConstraints.failed", {
+      selectedVideoId,
+      reason,
+    });
+  }
+
+  logAudioTrackDiagnostics(selectedVideoId, audioTracks);
+}
+
+async function applySenderQualitySettings(
+  sender: RTCRtpSender,
+  selectedVideoId: string,
+): Promise<void> {
+  const kind = sender.track?.kind;
+  if (kind !== "audio" && kind !== "video") {
+    return;
+  }
+
+  const parameters = sender.getParameters();
+  const encodings =
+    Array.isArray(parameters.encodings) && parameters.encodings.length > 0
+      ? parameters.encodings.map((encoding) => ({ ...encoding }))
+      : [{}];
+  const primaryEncoding = { ...encodings[0] };
+
+  primaryEncoding.priority = "high";
+
+  if (kind === "video") {
+    const videoSettings = sender.track?.getSettings();
+    const scaleResolutionDownBy = computeScaleResolutionDownBy(videoSettings?.width, videoSettings?.height);
+    primaryEncoding.maxBitrate = FLOAT_VIDEO_MAX_BITRATE_BPS;
+    primaryEncoding.maxFramerate = FLOAT_MAX_VIDEO_FPS;
+    primaryEncoding.scaleResolutionDownBy = scaleResolutionDownBy;
+    parameters.degradationPreference = "maintain-resolution";
+  } else {
+    primaryEncoding.maxBitrate = FLOAT_AUDIO_MAX_BITRATE_BPS;
+  }
+
+  encodings[0] = primaryEncoding;
+  parameters.encodings = encodings;
+
+  try {
+    await sender.setParameters(parameters);
+    if (kind === "audio") {
+      const applied = sender.getParameters();
+      debugLog("sender.parameters.audio.applied", {
+        selectedVideoId,
+        encodings: applied.encodings,
+      });
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : "setParameters failed";
+    debugLog("sender.parameters.failed", {
+      selectedVideoId,
+      kind,
+      reason,
+    });
+  }
+}
+
 function stopStreaming(): void {
   stopSourceProbe();
+  stopSenderStatsProbe();
 
   if (activePeer) {
     activePeer.onicecandidate = null;
@@ -446,17 +850,8 @@ async function startStreaming(videoId: string): Promise<void> {
   }
 
   const primaryVideoTrack = videoTracks[0];
-  try {
-    await primaryVideoTrack.applyConstraints({
-      frameRate: { ideal: FLOAT_TARGET_FPS, max: FLOAT_TARGET_FPS },
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "applyConstraints failed";
-    debugLog("source.track.applyConstraints.failed", {
-      selectedVideoId,
-      reason,
-    });
-  }
+  await applyTrackQualitySettings(selectedVideoId, primaryVideoTrack, audioTracks);
+
   const trackSettings = primaryVideoTrack.getSettings();
   debugLog("source.track", {
     selectedVideoId,
@@ -473,10 +868,17 @@ async function startStreaming(videoId: string): Promise<void> {
     iceServers: [],
   });
 
+  const senders: RTCRtpSender[] = [];
   stream.getTracks().forEach((track) => {
     track.enabled = true;
-    peer.addTrack(track, stream);
+    const sender = peer.addTrack(track, stream);
+    senders.push(sender);
   });
+
+  senders.forEach((sender) => {
+    applyCodecPreferences(peer, sender, selectedVideoId);
+  });
+  await Promise.all(senders.map((sender) => applySenderQualitySettings(sender, selectedVideoId)));
 
   peer.onicecandidate = (event) => {
     if (!event.candidate) {
@@ -504,16 +906,38 @@ async function startStreaming(videoId: string): Promise<void> {
 
   try {
     const offer = await peer.createOffer();
-    await peer.setLocalDescription(offer);
+    const rawOfferSdp = offer.sdp;
+    if (typeof rawOfferSdp !== "string" || rawOfferSdp.length === 0) {
+      throw new Error("offer SDP is missing");
+    }
+    const offerOpusFmtpBefore = extractOpusFmtpLinesFromSdp(rawOfferSdp);
+    const stereoOfferSdp = enforceStereoOpusInOfferSdp(rawOfferSdp, selectedVideoId);
+    const offerOpusFmtpAfter = extractOpusFmtpLinesFromSdp(stereoOfferSdp);
+    debugLog("sender.offer.audioSdp", {
+      selectedVideoId,
+      before: offerOpusFmtpBefore,
+      after: offerOpusFmtpAfter,
+    });
+    await peer.setLocalDescription({
+      type: "offer",
+      sdp: stereoOfferSdp,
+    });
+
+    const localOfferSdp = peer.localDescription?.sdp ?? stereoOfferSdp;
+    debugLog("sender.offer.audioSdp.localDescription", {
+      selectedVideoId,
+      opusFmtp: extractOpusFmtpLinesFromSdp(localOfferSdp),
+    });
     activePeer = peer;
     activeStream = stream;
     activeVideoId = selectedVideoId;
     activeSourceVideo = video;
+    startSenderStatsProbe(peer, selectedVideoId);
 
     chrome.runtime.sendMessage({
       type: "float:webrtc:offer",
       videoId: selectedVideoId,
-      sdp: offer.sdp,
+      sdp: localOfferSdp,
     });
   } catch (error) {
     const reason = error instanceof Error ? error.message : "offer creation failed";
@@ -589,6 +1013,11 @@ async function applyAnswer(videoId: string, sdp: string): Promise<void> {
   if (!activePeer || activeVideoId !== videoId) {
     return;
   }
+
+  debugLog("sender.answer.audioSdp", {
+    videoId,
+    opusFmtp: extractOpusFmtpLinesFromSdp(sdp),
+  });
 
   await activePeer.setRemoteDescription({
     type: "answer",

@@ -12,13 +12,13 @@
     background: black;
     overflow: hidden;
   }
-  #surface {
+  #player {
     width: 100%;
     height: 100%;
     object-fit: contain;
     background: black;
   }
-  #player {
+  #surface {
     position: fixed;
     width: 1px;
     height: 1px;
@@ -37,7 +37,21 @@
       const bridgeName = "floatReceiverBridge";
       const surface = document.getElementById("surface");
       const player = document.getElementById("player");
-      const surfaceContext = surface && surface.getContext ? surface.getContext("2d", { alpha: false }) : null;
+      const surfaceContext = (() => {
+        if (!surface || typeof surface.getContext !== "function") {
+          return null;
+        }
+        try {
+          return surface.getContext("2d", { alpha: false, desynchronized: true })
+            || surface.getContext("2d", { alpha: false })
+            || surface.getContext("2d");
+        } catch (_) {
+          return surface.getContext("2d", { alpha: false }) || surface.getContext("2d");
+        }
+      })();
+      const receiverState = {
+        debugEnabled: false,
+      };
       let peerConnection = null;
       let remoteStream = new MediaStream();
       let pendingRemoteCandidates = [];
@@ -64,23 +78,142 @@
         return prefix ? `${prefix}: ${message}` : message;
       }
 
+      function debugLog(event, payload = {}) {
+        if (!receiverState.debugEnabled) {
+          return;
+        }
+        post("debug", { event, payload });
+      }
+
+      function summarizeTrack(track) {
+        if (!track) {
+          return null;
+        }
+        let settings = null;
+        try {
+          settings = typeof track.getSettings === "function" ? track.getSettings() : null;
+        } catch (_) {}
+        return {
+          kind: track.kind,
+          id: track.id,
+          enabled: track.enabled,
+          muted: track.muted,
+          readyState: track.readyState,
+          settings,
+        };
+      }
+
+      function extractOpusFmtpLinesFromSdp(sdp) {
+        if (typeof sdp !== "string" || sdp.length === 0) {
+          return [];
+        }
+        const lines = sdp.split("\r\n");
+        const opusPayloadTypes = new Set();
+        lines.forEach((line) => {
+          const match = /^a=rtpmap:(\d+)\s+opus\/48000\/2$/i.exec(line);
+          if (match && match[1]) {
+            opusPayloadTypes.add(match[1]);
+          }
+        });
+
+        const fmtpLines = [];
+        lines.forEach((line) => {
+          const match = /^a=fmtp:(\d+)\s+/i.exec(line);
+          if (!match || !match[1] || !opusPayloadTypes.has(match[1])) {
+            return;
+          }
+          fmtpLines.push(line);
+        });
+        return fmtpLines;
+      }
+
+      function appendSdpFmtpParameter(line, key, value) {
+        const prefixEnd = line.indexOf(" ");
+        if (prefixEnd < 0) {
+          return line;
+        }
+        const prefix = line.slice(0, prefixEnd + 1);
+        const rawValue = line.slice(prefixEnd + 1);
+        const segments = rawValue
+          .split(";")
+          .map((segment) => segment.trim())
+          .filter((segment) => segment.length > 0);
+        const target = `${key}=${value}`;
+        const keyPrefix = `${key}=`;
+        const existingIndex = segments.findIndex((segment) =>
+          segment.toLowerCase().startsWith(keyPrefix.toLowerCase())
+        );
+        if (existingIndex >= 0) {
+          segments[existingIndex] = target;
+        } else {
+          segments.push(target);
+        }
+        return `${prefix}${segments.join(";")}`;
+      }
+
+      function enforceStereoOpusInSdp(sdp) {
+        if (typeof sdp !== "string" || sdp.length === 0) {
+          return sdp;
+        }
+        const lines = sdp.split("\r\n");
+        const opusPayloadTypes = new Set();
+        lines.forEach((line) => {
+          const match = /^a=rtpmap:(\d+)\s+opus\/48000\/2$/i.exec(line);
+          if (match && match[1]) {
+            opusPayloadTypes.add(match[1]);
+          }
+        });
+        if (opusPayloadTypes.size === 0) {
+          return sdp;
+        }
+
+        let updated = false;
+        const transformed = lines.map((line) => {
+          const match = /^a=fmtp:(\d+)\s+/i.exec(line);
+          if (!match || !match[1] || !opusPayloadTypes.has(match[1])) {
+            return line;
+          }
+          updated = true;
+          let next = appendSdpFmtpParameter(line, "stereo", "1");
+          next = appendSdpFmtpParameter(next, "sprop-stereo", "1");
+          return next;
+        });
+
+        if (!updated) {
+          const mutable = [...transformed];
+          const opusPayloadType = Array.from(opusPayloadTypes)[0];
+          for (let index = 0; index < mutable.length; index += 1) {
+            const line = mutable[index];
+            if (new RegExp(`^a=rtpmap:${opusPayloadType}\\s+opus/48000/2$`, "i").test(line)) {
+              mutable.splice(index + 1, 0, `a=fmtp:${opusPayloadType} stereo=1;sprop-stereo=1`);
+              return mutable.join("\r\n");
+            }
+          }
+        }
+
+        return transformed.join("\r\n");
+      }
+
       function updateVideoSize() {
         const width = Number(player.videoWidth || 0);
         const height = Number(player.videoHeight || 0);
-        if (surface && width > 0 && height > 0) {
-          if (surface.width !== width) {
-            surface.width = width;
-          }
-          if (surface.height !== height) {
-            surface.height = height;
-          }
-        }
         post("videoSize", { width, height });
+        debugLog("video.size", {
+          width,
+          height,
+          readyState: player.readyState,
+        });
       }
 
       async function ensurePlayback() {
         try {
           await player.play();
+          debugLog("video.play.ok", {
+            readyState: player.readyState,
+            paused: player.paused,
+            muted: player.muted,
+            volume: player.volume,
+          });
         } catch (error) {
           post("error", { reason: describeError(error, "player.play failed") });
         }
@@ -101,10 +234,19 @@
         remoteStream.addTrack(track);
         player.srcObject = remoteStream;
         updateVideoSize();
+        debugLog("track.attach", {
+          track: summarizeTrack(track),
+          streamTrackCount: remoteStream.getTracks().length,
+          audioTrackCount: remoteStream.getAudioTracks().length,
+          videoTrackCount: remoteStream.getVideoTracks().length,
+        });
         void ensurePlayback();
         post("streaming", { isStreaming: true });
 
         track.addEventListener("ended", () => {
+          debugLog("track.ended", {
+            track: summarizeTrack(track),
+          });
           if (remoteStream) {
             remoteStream.removeTrack(track);
           }
@@ -114,6 +256,9 @@
         });
 
         track.addEventListener("unmute", () => {
+          debugLog("track.unmute", {
+            track: summarizeTrack(track),
+          });
           if (track.kind === "video") {
             updateVideoSize();
             startFrameLoop();
@@ -160,12 +305,14 @@
         }
         frameLoopActive = true;
         frameLoopToken += 1;
+        debugLog("video.frameLoop.start", { token: frameLoopToken });
         runFrameLoop(frameLoopToken);
       }
 
       function stopFrameLoop() {
         frameLoopActive = false;
         frameLoopToken += 1;
+        debugLog("video.frameLoop.stop", { token: frameLoopToken });
       }
 
       async function flushPendingRemoteCandidates() {
@@ -203,6 +350,9 @@
         }
 
         const pc = new RTCPeerConnection({ iceServers: [] });
+        debugLog("webrtc.pc.create", {
+          configuration: { iceServers: [] },
+        });
 
         pc.onicecandidate = (event) => {
           if (!event.candidate) {
@@ -216,6 +366,10 @@
         };
 
         pc.ontrack = (event) => {
+          debugLog("track.ontrack", {
+            track: summarizeTrack(event.track),
+            streamCount: event.streams ? event.streams.length : 0,
+          });
           attachTrack(event.track);
 
           if (event.streams && event.streams.length > 0) {
@@ -227,6 +381,12 @@
 
         pc.onconnectionstatechange = () => {
           const state = pc.connectionState;
+          debugLog("webrtc.connectionState", {
+            state,
+            iceConnectionState: pc.iceConnectionState,
+            iceGatheringState: pc.iceGatheringState,
+            signalingState: pc.signalingState,
+          });
           post("connectionState", { state });
           if (state === "failed" || state === "closed" || state === "disconnected") {
             post("streaming", { isStreaming: false });
@@ -239,6 +399,10 @@
       async function stopInternal() {
         pendingRemoteCandidates = [];
         stopFrameLoop();
+        debugLog("receiver.stopInternal", {
+          trackCount: remoteStream ? remoteStream.getTracks().length : 0,
+          hadPeerConnection: Boolean(peerConnection),
+        });
 
         if (peerConnection) {
           peerConnection.onicecandidate = null;
@@ -277,30 +441,77 @@
       player.addEventListener("loadedmetadata", updateVideoSize);
       player.addEventListener("resize", updateVideoSize);
       player.addEventListener("playing", () => {
+        debugLog("video.playing", {
+          readyState: player.readyState,
+          currentTime: player.currentTime,
+          paused: player.paused,
+          videoWidth: player.videoWidth,
+          videoHeight: player.videoHeight,
+        });
         startFrameLoop();
         post("streaming", { isStreaming: true });
       });
-      player.addEventListener("ended", () => post("streaming", { isStreaming: false }));
-      player.addEventListener("error", () => post("error", { reason: "video element error" }));
+      player.addEventListener("ended", () => {
+        debugLog("video.ended", { currentTime: player.currentTime });
+        post("streaming", { isStreaming: false });
+      });
+      player.addEventListener("error", () => {
+        const mediaError = player.error;
+        debugLog("video.error", {
+          code: mediaError ? mediaError.code : null,
+          message: mediaError ? mediaError.message || null : null,
+          readyState: player.readyState,
+        });
+        post("error", { reason: "video element error" });
+      });
 
       window.FloatReceiver = {
+        setDebugLoggingEnabled(enabled) {
+          receiverState.debugEnabled = Boolean(enabled);
+          if (receiverState.debugEnabled) {
+            debugLog("receiver.debug.enabled", { enabled: true });
+          }
+          return receiverState.debugEnabled;
+        },
+
         async handleOffer(offerSdp) {
           if (typeof offerSdp !== "string" || offerSdp.length === 0) {
             throw new Error("Missing offer SDP");
           }
 
+          debugLog("offer.received", {
+            sdpLength: offerSdp.length,
+            opusFmtpLines: extractOpusFmtpLinesFromSdp(offerSdp),
+          });
           await stopInternal();
 
           peerConnection = createPeerConnection();
           await peerConnection.setRemoteDescription({ type: "offer", sdp: offerSdp });
 
           const answer = await peerConnection.createAnswer();
-          await peerConnection.setLocalDescription(answer);
+          const rawAnswerSdp = (answer && typeof answer.sdp === "string") ? answer.sdp : "";
+          const stereoAnswerSdp = enforceStereoOpusInSdp(rawAnswerSdp);
+          if (stereoAnswerSdp !== rawAnswerSdp) {
+            debugLog("answer.opusStereo.sdpUpdated", {
+              before: extractOpusFmtpLinesFromSdp(rawAnswerSdp),
+              after: extractOpusFmtpLinesFromSdp(stereoAnswerSdp),
+            });
+          }
+          await peerConnection.setLocalDescription({
+            type: "answer",
+            sdp: stereoAnswerSdp,
+          });
           await flushPendingRemoteCandidates();
 
           void ensurePlayback();
 
-          return (peerConnection.localDescription && peerConnection.localDescription.sdp) || answer.sdp || "";
+          const answerSdp = (peerConnection.localDescription && peerConnection.localDescription.sdp) || answer.sdp || "";
+          debugLog("answer.created", {
+            sdpLength: answerSdp.length,
+            opusFmtpLines: extractOpusFmtpLinesFromSdp(answerSdp),
+          });
+
+          return answerSdp;
         },
 
         async addIceCandidate(candidate) {
@@ -313,6 +524,11 @@
       };
 
       post("ready", {
+        userAgent: navigator.userAgent,
+        isSecureContext: Boolean(window.isSecureContext),
+        hasRTCPeerConnection: typeof RTCPeerConnection === "function",
+      });
+      debugLog("receiver.ready", {
         userAgent: navigator.userAgent,
         isSecureContext: Boolean(window.isSecureContext),
         hasRTCPeerConnection: typeof RTCPeerConnection === "function",

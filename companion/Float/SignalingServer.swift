@@ -2,7 +2,16 @@ import Combine
 import Foundation
 import Network
 
-private let protocolDebugLoggingEnabled = true
+private let signalingDebugLoggingDefaultsKey = "Float.signalingDebugLoggingEnabled"
+private let receiverDebugLoggingDefaultsKey = "Float.receiverDebugLoggingEnabled"
+
+private func loadSignalingDebugLoggingEnabled() -> Bool {
+    UserDefaults.standard.object(forKey: signalingDebugLoggingDefaultsKey) as? Bool ?? false
+}
+
+private func loadReceiverDebugLoggingEnabled() -> Bool {
+    UserDefaults.standard.object(forKey: receiverDebugLoggingDefaultsKey) as? Bool ?? false
+}
 
 @MainActor
 final class SignalingServer: ObservableObject {
@@ -51,6 +60,8 @@ final class SignalingServer: ObservableObject {
     @Published private(set) var lastExtensionDebugLog: String?
     @Published private(set) var autoStartBackgroundEnabled = false
     @Published private(set) var autoStopForegroundEnabled = true
+    @Published private(set) var signalingDebugLoggingEnabled = false
+    @Published private(set) var receiverDebugLoggingEnabled = false
 
     struct VideoSource: Identifiable {
         let tabId: Int
@@ -94,8 +105,11 @@ final class SignalingServer: ObservableObject {
     init() {
         autoStartBackgroundEnabled = UserDefaults.standard.object(forKey: Self.autoStartBackgroundDefaultsKey) as? Bool ?? false
         autoStopForegroundEnabled = UserDefaults.standard.object(forKey: Self.autoStopForegroundDefaultsKey) as? Bool ?? true
+        signalingDebugLoggingEnabled = loadSignalingDebugLoggingEnabled()
+        receiverDebugLoggingEnabled = loadReceiverDebugLoggingEnabled()
         var receiver = makeWebRTCReceiver()
         self.webRTCReceiver = receiver
+        receiver.setDebugLoggingEnabled(receiverDebugLoggingEnabled)
         receiver.onLocalIceCandidate = { [weak self] candidate in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -195,7 +209,7 @@ final class SignalingServer: ObservableObject {
     }
 
     func requestStop() {
-        if protocolDebugLoggingEnabled {
+        if signalingDebugLoggingEnabled {
             print("[Float Signal] requestStop called")
         }
         if stopRequestInFlight {
@@ -227,6 +241,25 @@ final class SignalingServer: ObservableObject {
         autoStopForegroundEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: Self.autoStopForegroundDefaultsKey)
         broadcastAutoStopForegroundSetting()
+    }
+
+    func setSignalingDebugLoggingEnabled(_ enabled: Bool) {
+        guard signalingDebugLoggingEnabled != enabled else {
+            return
+        }
+
+        signalingDebugLoggingEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: signalingDebugLoggingDefaultsKey)
+    }
+
+    func setReceiverDebugLoggingEnabled(_ enabled: Bool) {
+        guard receiverDebugLoggingEnabled != enabled else {
+            return
+        }
+
+        receiverDebugLoggingEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: receiverDebugLoggingDefaultsKey)
+        webRTCReceiver.setDebugLoggingEnabled(enabled)
     }
 
     func isActiveSource(_ source: VideoSource) -> Bool {
@@ -391,7 +424,7 @@ final class SignalingServer: ObservableObject {
     }
 
     private func handleReceiverStreamingChanged(_ isStreaming: Bool) {
-        if protocolDebugLoggingEnabled {
+        if signalingDebugLoggingEnabled {
             print("[Float Signal] receiver.onStreamingChanged value=\(isStreaming)")
         }
 
@@ -428,7 +461,7 @@ final class SignalingServer: ObservableObject {
 
     private func requestPlaybackChange(isPlaying: Bool) {
         guard let activeTabId, let activeVideoId else {
-            if protocolDebugLoggingEnabled {
+            if signalingDebugLoggingEnabled {
                 print("[Float Signal] requestPlaybackChange dropped: missing active target")
             }
             return
@@ -444,7 +477,7 @@ final class SignalingServer: ObservableObject {
     private func requestSeekChange(intervalSeconds: Double) {
         guard intervalSeconds.isFinite else { return }
         guard let activeTabId, let activeVideoId else {
-            if protocolDebugLoggingEnabled {
+            if signalingDebugLoggingEnabled {
                 print("[Float Signal] requestSeekChange dropped: missing active target")
             }
             return
@@ -465,7 +498,7 @@ final class SignalingServer: ObservableObject {
             return
         }
         guard let video = tab.videos.first(where: { $0.videoId == activeVideoId }) else {
-            if protocolDebugLoggingEnabled {
+            if signalingDebugLoggingEnabled {
                 print("[Float Signal] syncReceiverPlaybackStateFromTabs: active video not found videoId=\(activeVideoId) tabId=\(activeTabId)")
             }
             return
@@ -583,7 +616,7 @@ final class SignalingServer: ObservableObject {
     }
 
     private func log(_ message: String) {
-        guard protocolDebugLoggingEnabled else { return }
+        guard signalingDebugLoggingEnabled else { return }
         print("[Float Signaling] \(message)")
     }
 }
@@ -673,7 +706,7 @@ private final class WebSocketClient {
     }
 
     private func fail(_ reason: String) {
-        if protocolDebugLoggingEnabled {
+        if loadSignalingDebugLoggingEnabled() {
             print("[Float WS] \(reason)")
         }
         close()
