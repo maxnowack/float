@@ -13,6 +13,32 @@ final class SignalingServer: ObservableObject {
         case error(String)
     }
 
+    private enum StatusIconState {
+        case extensionNotConnected
+        case extensionConnectedNoVideo
+        case extensionConnectedOneVideo
+        case extensionConnectedMultipleVideos
+        case extensionConnectedStreamingActive
+        case error
+
+        var symbolName: String {
+            switch self {
+            case .extensionNotConnected:
+                return "cable.connector.slash"
+            case .extensionConnectedNoVideo:
+                return "pip.remove"
+            case .extensionConnectedOneVideo:
+                return "pip"
+            case .extensionConnectedMultipleVideos:
+                return "pip"
+            case .extensionConnectedStreamingActive:
+                return "pip.fill"
+            case .error:
+                return "exclamationmark.circle.fill"
+            }
+        }
+    }
+
     static let port: UInt16 = 17891
 
     @Published private(set) var serverState: ServerState = .starting
@@ -107,24 +133,31 @@ final class SignalingServer: ObservableObject {
     }
 
     func iconName() -> String {
-        let sourceCount = availableSources.count
-        switch (serverState, sourceCount, isStreaming) {
-        case (.error, _, _):
-            return "exclamationmark.circle.fill"
-        case (_, 0, true):
-            return "pip.fill"
-        case (_, 0, false):
-            return "pip.slash"
-        case (_, 1, true):
-            return "pip.fill"
-        case (_, 1, false):
-            return "pip"
-        case (_, let count, true) where count > 1:
-            return "square.stack.3d.up.fill"
-        case (_, let count, false) where count > 1:
-            return "square.stack.3d.up"
-        default:
-            return "pip"
+        statusIconState().symbolName
+    }
+
+    private func statusIconState() -> StatusIconState {
+        if case .error = serverState {
+            return .error
+        }
+        if isStreaming {
+            return .extensionConnectedStreamingActive
+        }
+
+        switch serverState {
+        case .starting, .waiting:
+            return .extensionNotConnected
+        case .connected:
+            switch availableSources.count {
+            case 0:
+                return .extensionConnectedNoVideo
+            case 1:
+                return .extensionConnectedOneVideo
+            default:
+                return .extensionConnectedMultipleVideos
+            }
+        case .error:
+            return .error
         }
     }
 
