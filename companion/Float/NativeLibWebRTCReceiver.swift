@@ -28,7 +28,8 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         RTCMTLNSVideoView.isMetalAvailable()
     }
 
-    private let pipController = NativePiPController()
+    private let pipController: PiPControlling
+    private let pipVideoRenderer: RTCVideoRenderer?
     private let peerConnectionFactory: RTCPeerConnectionFactory
     private let videoView: RTCMTLNSVideoView
 
@@ -55,6 +56,13 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         if !Self.didInitializeSSL {
             _ = RTCInitializeSSL()
             Self.didInitializeSSL = true
+        }
+
+        pipController = PiPControllerFactory.makeController()
+        if let nativePiPController = pipController as? NativePiPController {
+            pipVideoRenderer = nativePiPController.rtcVideoRenderer()
+        } else {
+            pipVideoRenderer = nil
         }
 
         peerConnectionFactory = RTCPeerConnectionFactory()
@@ -183,6 +191,9 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         pendingRemoteCandidates.removeAll()
 
         if let remoteVideoTrack {
+            if let pipVideoRenderer {
+                remoteVideoTrack.remove(pipVideoRenderer)
+            }
             remoteVideoTrack.remove(videoView)
             self.remoteVideoTrack = nil
         }
@@ -206,12 +217,21 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
 
         if let existing = remoteVideoTrack {
+            if let pipVideoRenderer {
+                existing.remove(pipVideoRenderer)
+            }
             existing.remove(videoView)
         }
 
         remoteVideoTrack = track
         track.isEnabled = true
-        track.add(videoView)
+        if let pipVideoRenderer {
+            print("[Float NativeRTC] attaching video track to PiP renderer trackId=\(track.trackId)")
+            track.add(pipVideoRenderer)
+        } else {
+            print("[Float NativeRTC] attaching video track to metal view trackId=\(track.trackId)")
+            track.add(videoView)
+        }
         pipController.requestStart()
         onStreamingChanged?(true)
 

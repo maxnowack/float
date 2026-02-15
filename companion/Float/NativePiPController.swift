@@ -1,45 +1,267 @@
 import AppKit
-import Darwin
+import AVFoundation
+import AVKit
+import CoreMedia
 import Foundation
-import ObjectiveC.runtime
+import WebRTC
+
+private final class NativePiPFrameRenderer: NSObject, RTCVideoRenderer {
+    private weak var controller: NativePiPController?
+    private var cachedFormatDescription: CMVideoFormatDescription?
+    private var cachedFormatKey: (width: Int, height: Int, pixelFormat: OSType)?
+    private var cachedI420PixelBuffer: CVPixelBuffer?
+    private var cachedI420PixelBufferKey: (width: Int, height: Int)?
+    private var lastPresentationTime: CMTime = .invalid
+    private var warnedUnsupportedBufferType = false
+    private let renderQueue = DispatchQueue(label: "de.unsou.Float.NativePiPFrameRenderer")
+
+    init(controller: NativePiPController) {
+        self.controller = controller
+    }
+
+    func setSize(_ size: CGSize) {
+        DispatchQueue.main.async { [weak self] in
+            self?.controller?.handleVideoRendererSizeChanged(size)
+        }
+    }
+
+    func renderFrame(_ frame: RTCVideoFrame?) {
+        guard let frame else { return }
+
+        renderQueue.async { [weak self] in
+            guard let self else { return }
+            guard let renderPayload = self.renderPayload(from: frame) else { return }
+            let pixelBuffer = renderPayload.pixelBuffer
+            guard let sampleBuffer = self.sampleBuffer(from: pixelBuffer) else { return }
+
+            DispatchQueue.main.async { [weak self] in
+                self?.controller?.noteFrameRendered(
+                    width: CVPixelBufferGetWidth(pixelBuffer),
+                    height: CVPixelBufferGetHeight(pixelBuffer),
+                    pixelFormat: CVPixelBufferGetPixelFormatType(pixelBuffer),
+                    bufferKind: renderPayload.bufferKind
+                )
+                self?.controller?.enqueueSampleBuffer(sampleBuffer)
+            }
+        }
+    }
+
+    private struct RenderPayload {
+        let pixelBuffer: CVPixelBuffer
+        let bufferKind: String
+    }
+
+    private func renderPayload(from frame: RTCVideoFrame) -> RenderPayload? {
+        if let cvBuffer = frame.buffer as? RTCCVPixelBuffer {
+            return RenderPayload(pixelBuffer: cvBuffer.pixelBuffer, bufferKind: "cv")
+        }
+
+        let i420Buffer = frame.buffer.toI420()
+        if let converted = i420PixelBuffer(from: i420Buffer) {
+            return RenderPayload(pixelBuffer: converted, bufferKind: "i420")
+        }
+
+        if !warnedUnsupportedBufferType {
+            warnedUnsupportedBufferType = true
+            print("[Float PiP] unsupported frame buffer type=\(type(of: frame.buffer)); frame dropped")
+        }
+        return nil
+    }
+
+    private func i420PixelBuffer(from i420Buffer: any RTCI420BufferProtocol) -> CVPixelBuffer? {
+        let width = Int(i420Buffer.width)
+        let height = Int(i420Buffer.height)
+
+        guard width > 0, height > 0 else { return nil }
+
+        if cachedI420PixelBuffer == nil ||
+            cachedI420PixelBufferKey?.width != width ||
+            cachedI420PixelBufferKey?.height != height
+        {
+            var createdBuffer: CVPixelBuffer?
+            let attributes: [CFString: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+            ]
+            let status = CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                kCVPixelFormatType_420YpCbCr8PlanarFullRange,
+                attributes as CFDictionary,
+                &createdBuffer
+            )
+            guard status == kCVReturnSuccess, let createdBuffer else {
+                print("[Float PiP] failed to allocate I420 CVPixelBuffer status=\(status)")
+                return nil
+            }
+            cachedI420PixelBuffer = createdBuffer
+            cachedI420PixelBufferKey = (width: width, height: height)
+        }
+
+        guard let pixelBuffer = cachedI420PixelBuffer else { return nil }
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, []) }
+
+        guard CVPixelBufferGetPlaneCount(pixelBuffer) >= 3 else {
+            return nil
+        }
+
+        guard let dstYBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let dstUBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1),
+              let dstVBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 2)
+        else {
+            return nil
+        }
+
+        copyPlane(
+            srcBase: i420Buffer.dataY,
+            srcStride: Int(i420Buffer.strideY),
+            dstBase: dstYBase,
+            dstStride: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0),
+            width: width,
+            height: height
+        )
+
+        copyPlane(
+            srcBase: i420Buffer.dataU,
+            srcStride: Int(i420Buffer.strideU),
+            dstBase: dstUBase,
+            dstStride: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1),
+            width: Int(i420Buffer.chromaWidth),
+            height: Int(i420Buffer.chromaHeight)
+        )
+
+        copyPlane(
+            srcBase: i420Buffer.dataV,
+            srcStride: Int(i420Buffer.strideV),
+            dstBase: dstVBase,
+            dstStride: CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 2),
+            width: Int(i420Buffer.chromaWidth),
+            height: Int(i420Buffer.chromaHeight)
+        )
+
+        return pixelBuffer
+    }
+
+    private func copyPlane(
+        srcBase: UnsafePointer<UInt8>,
+        srcStride: Int,
+        dstBase: UnsafeMutableRawPointer,
+        dstStride: Int,
+        width: Int,
+        height: Int
+    ) {
+        let dstBytes = dstBase.assumingMemoryBound(to: UInt8.self)
+        for row in 0..<height {
+            let srcRow = srcBase.advanced(by: row * srcStride)
+            let dstRow = dstBytes.advanced(by: row * dstStride)
+            memcpy(dstRow, srcRow, width)
+        }
+    }
+
+    private func sampleBuffer(from pixelBuffer: CVPixelBuffer) -> CMSampleBuffer? {
+        let width = CVPixelBufferGetWidth(pixelBuffer)
+        let height = CVPixelBufferGetHeight(pixelBuffer)
+        let pixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
+        let formatKey = (width: width, height: height, pixelFormat: pixelFormat)
+
+        if cachedFormatDescription == nil || cachedFormatKey?.width != width || cachedFormatKey?.height != height || cachedFormatKey?.pixelFormat != pixelFormat {
+            var formatDescription: CMVideoFormatDescription?
+            let status = CMVideoFormatDescriptionCreateForImageBuffer(
+                allocator: kCFAllocatorDefault,
+                imageBuffer: pixelBuffer,
+                formatDescriptionOut: &formatDescription
+            )
+            guard status == noErr, let formatDescription else {
+                print("[Float PiP] failed to create format description status=\(status)")
+                return nil
+            }
+            cachedFormatDescription = formatDescription
+            cachedFormatKey = formatKey
+        }
+
+        guard let cachedFormatDescription else {
+            return nil
+        }
+
+        var presentationTime = CMClockGetTime(CMClockGetHostTimeClock())
+        if lastPresentationTime.isValid, CMTimeCompare(presentationTime, lastPresentationTime) <= 0 {
+            presentationTime = CMTimeAdd(lastPresentationTime, CMTime(value: 1, timescale: 600))
+        }
+        lastPresentationTime = presentationTime
+
+        var sampleTiming = CMSampleTimingInfo(
+            duration: .invalid,
+            presentationTimeStamp: presentationTime,
+            decodeTimeStamp: .invalid
+        )
+
+        var sampleBuffer: CMSampleBuffer?
+        let status = CMSampleBufferCreateReadyWithImageBuffer(
+            allocator: kCFAllocatorDefault,
+            imageBuffer: pixelBuffer,
+            formatDescription: cachedFormatDescription,
+            sampleTiming: &sampleTiming,
+            sampleBufferOut: &sampleBuffer
+        )
+        if status != noErr {
+            print("[Float PiP] failed to create sample buffer status=\(status)")
+            return nil
+        }
+        if let sampleBuffer {
+            markForImmediateDisplay(sampleBuffer)
+        }
+        return sampleBuffer
+    }
+
+    private func markForImmediateDisplay(_ sampleBuffer: CMSampleBuffer) {
+        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: true) else {
+            return
+        }
+        guard CFArrayGetCount(attachments) > 0 else { return }
+        let attachment = unsafeBitCast(CFArrayGetValueAtIndex(attachments, 0), to: CFMutableDictionary.self)
+        CFDictionarySetValue(
+            attachment,
+            Unmanaged.passUnretained(kCMSampleAttachmentKey_DisplayImmediately).toOpaque(),
+            Unmanaged.passUnretained(kCFBooleanTrue).toOpaque()
+        )
+    }
+}
 
 @MainActor
-final class NativePiPController: NSObject {
+final class NativePiPController: NSObject, PiPControlling {
     private enum Constants {
-        static let defaultHostSize = CGSize(width: 1280, height: 720)
-        static let visibilityWatchdogInterval: TimeInterval = 0.4
+        static let defaultLayerSize = CGSize(width: 1280, height: 720)
+        static let minLayerDimension: CGFloat = 1
+        static let maxLayerDimension: CGFloat = 8192
+        static let startRetryIntervalSeconds: TimeInterval = 0.25
+        static let inlineHostSize = CGSize(width: 320, height: 180)
+        static let inlineHostOrigin = CGPoint(x: -10_000, y: -10_000)
+        static let fallbackPlaybackDurationSeconds: Double = 10 * 60 * 60
     }
 
     var onPictureInPictureClosed: (() -> Void)?
     var onPlaybackCommand: ((Bool) -> Void)?
     var onSeekCommand: ((Double) -> Void)?
 
-    private let hostView = NSView(
-        frame: CGRect(origin: .zero, size: Constants.defaultHostSize)
-    )
-    private weak var hostedContentView: NSView?
+    static var isSupported: Bool {
+        AVPictureInPictureController.isPictureInPictureSupported()
+    }
 
-    private var privatePiPController: NSObject?
-    private var privatePiPContentViewController = NSViewController()
-
-    private var privatePiPPresented = false
+    private let sampleBufferDisplayLayer = AVSampleBufferDisplayLayer()
+    private let inlineHostView = NSView(frame: CGRect(origin: .zero, size: Constants.inlineHostSize))
+    private var inlineHostWindow: NSWindow?
+    private lazy var frameRenderer = NativePiPFrameRenderer(controller: self)
+    private var pictureInPictureController: AVPictureInPictureController?
+    private var playbackTimebase: CMTimebase?
     private var wantsStart = false
-    private var isStartingPictureInPicture = false
-    private var isStoppingPrivatePiPProgrammatically = false
+    private var startRetryTimer: Timer?
+    private var startAttemptCount = 0
+    private var isStoppingProgrammatically = false
+    private var sourceVideoSize: CGSize = .zero
+    private var renderedFrameCount: Int = 0
+    private var hasRenderedFirstFrame = false
 
-    private var expectedVideoAspectRatio: CGFloat = 16.0 / 9.0
-
-    private var privatePiPPanel: NSWindow?
-    private var privatePiPPanelCloseObserver: NSObjectProtocol?
-    private var privatePiPVisibilityWatchdog: Timer?
-    private var isObservingPrivatePiPPanel = false
-    private var isObservingPrivatePiPPlaying = false
-    private var privatePiPPanelKVOContext = 0
-    private var privatePiPPlayingKVOContext = 0
-    private var isUpdatingPlaybackStateProgrammatically = false
-    private var suppressPlaybackCommands = false
-    private var defaultPrivatePiPControls: UInt64 = 3
-    private var defaultPrivatePiPControlStyle: Int = 1
     private var playbackElapsedSeconds: Double = 0
     private var playbackAnchorDate: Date?
     private var playbackIsPlaying = true
@@ -50,67 +272,46 @@ final class NativePiPController: NSObject {
         setupIfNeeded()
     }
 
-    deinit {
-        if isObservingPrivatePiPPlaying, let controller = privatePiPController {
-            controller.removeObserver(self, forKeyPath: "playing", context: &privatePiPPlayingKVOContext)
-            isObservingPrivatePiPPlaying = false
-        }
-    }
-
     func setContentView(_ view: NSView) {
-        if hostedContentView === view {
-            return
-        }
-
-        hostedContentView?.removeFromSuperview()
-        hostedContentView = view
-        view.translatesAutoresizingMaskIntoConstraints = false
-        hostView.addSubview(view)
-        NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: hostView.trailingAnchor),
-            view.topAnchor.constraint(equalTo: hostView.topAnchor),
-            view.bottomAnchor.constraint(equalTo: hostView.bottomAnchor),
-        ])
+        _ = view
     }
 
     func requestStart() {
-        suppressPlaybackCommands = false
         wantsStart = true
-        attemptStartPiP()
+        startStartRetryIfNeeded()
+        if hasRenderedFirstFrame {
+            attemptStart()
+        } else {
+            print("[Float PiP] start deferred waitingForFirstFrame=true")
+        }
     }
 
     func stop() {
-        suppressPlaybackCommands = true
         wantsStart = false
-        isStartingPictureInPicture = false
-
-        guard privatePiPPresented else { return }
-
-        isStoppingPrivatePiPProgrammatically = true
-        handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: false)
-
-        if let privatePiPController {
-            _ = dismissPrivatePictureInPicture(on: privatePiPController)
+        stopStartRetry()
+        hasRenderedFirstFrame = false
+        renderedFrameCount = 0
+        guard let pictureInPictureController else { return }
+        guard pictureInPictureController.isPictureInPictureActive else {
+            sampleBufferDisplayLayer.flushAndRemoveImage()
+            return
         }
 
-        isStoppingPrivatePiPProgrammatically = false
+        isStoppingProgrammatically = true
+        pictureInPictureController.stopPictureInPicture()
+        sampleBufferDisplayLayer.flushAndRemoveImage()
     }
 
     func updateExpectedVideoSize(_ size: CGSize) {
-        guard size.width > 0, size.height > 0 else { return }
-
-        let ratio = size.width / size.height
-        guard ratio.isFinite, ratio > 0 else { return }
-        guard abs(ratio - expectedVideoAspectRatio) >= 0.01 else { return }
-
-        expectedVideoAspectRatio = ratio
-        applyPrivatePiPAspectConstraints()
+        guard let sanitizedSize = sanitizeLayerSize(size) else { return }
+        sourceVideoSize = sanitizedSize
+        print("[Float PiP] sourceVideoSize width=\(Int(sanitizedSize.width)) height=\(Int(sanitizedSize.height))")
     }
 
     func updatePlaybackState(_ isPlaying: Bool) {
         updatePlaybackClock(isPlaying: isPlaying)
-        pushPlaybackStateToPiPController()
+        syncPlaybackTimebase()
+        pictureInPictureController?.invalidatePlaybackState()
     }
 
     func updatePlaybackProgress(elapsedSeconds: Double?, durationSeconds: Double?) {
@@ -124,316 +325,169 @@ final class NativePiPController: NSObject {
         if let durationSeconds {
             if durationSeconds.isFinite, durationSeconds > 0 {
                 playbackDurationSeconds = durationSeconds
-            } else if !durationSeconds.isFinite {
-                playbackDurationSeconds = .infinity
             } else {
                 playbackDurationSeconds = 0
             }
         }
 
         playbackElapsedSeconds = clampElapsedTime(playbackElapsedSeconds)
-        pushPlaybackStateToPiPController()
+        syncPlaybackTimebase()
+        pictureInPictureController?.invalidatePlaybackState()
+    }
+
+    func rtcVideoRenderer() -> RTCVideoRenderer {
+        frameRenderer
+    }
+
+    fileprivate func handleVideoRendererSizeChanged(_ size: CGSize) {
+        updateExpectedVideoSize(size)
+    }
+
+    fileprivate func enqueueSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        if sampleBufferDisplayLayer.status == .failed {
+            let message = sampleBufferDisplayLayer.error?.localizedDescription ?? "unknown"
+            print("[Float PiP] displayLayer failed; flushing error=\(message)")
+            sampleBufferDisplayLayer.flush()
+        }
+
+        sampleBufferDisplayLayer.enqueue(sampleBuffer)
+        if sampleBufferDisplayLayer.status == .failed {
+            let message = sampleBufferDisplayLayer.error?.localizedDescription ?? "unknown"
+            print("[Float PiP] displayLayer failed after enqueue error=\(message)")
+        }
+        attemptStart()
+    }
+
+    fileprivate func noteFrameRendered(width: Int, height: Int, pixelFormat: OSType, bufferKind: String) {
+        renderedFrameCount += 1
+        if !hasRenderedFirstFrame {
+            hasRenderedFirstFrame = true
+            print("[Float PiP] first frame observed")
+            if wantsStart {
+                attemptStart()
+            }
+        }
+        if renderedFrameCount == 1 || renderedFrameCount % 120 == 0 {
+            print("[Float PiP] frame.rendered count=\(renderedFrameCount) size=\(width)x\(height) pixelFormat=\(fourCC(pixelFormat)) buffer=\(bufferKind) layerStatus=\(sampleBufferDisplayLayer.status.rawValue)")
+        }
     }
 
     private func setupIfNeeded() {
-        guard privatePiPController == nil else { return }
-
-        setupPrivatePiPHostView()
-
-        if !setupPrivatePiPController() {
-            print("[Float PiP] Failed to initialize private PiP controller")
-        }
-    }
-
-    private func setupPrivatePiPHostView() {
-        hostView.wantsLayer = true
-        if hostView.layer?.backgroundColor == nil {
-            hostView.layer?.backgroundColor = NSColor.black.cgColor
+        guard Self.isSupported else {
+            print("[Float PiP] PiP is not supported on this system")
+            return
         }
 
-        privatePiPContentViewController = NSViewController()
-        privatePiPContentViewController.view = hostView
-    }
+        ensureInlineHostWindow()
 
-    private func setupPrivatePiPController() -> Bool {
-        let path = "/System/Library/PrivateFrameworks/PIP.framework/Versions/A/PIP"
-        guard dlopen(path, RTLD_NOW) != nil else {
-            return false
-        }
+        sampleBufferDisplayLayer.videoGravity = .resizeAspect
+        sampleBufferDisplayLayer.backgroundColor = NSColor.black.cgColor
+        applyLayerGeometry(Constants.defaultLayerSize)
+        configurePlaybackTimebase()
 
-        guard let pipClass = NSClassFromString("PIPViewController") as? NSObject.Type else {
-            return false
-        }
-
-        let controller = pipClass.init()
-        let presentSelector = NSSelectorFromString("presentViewControllerAsPictureInPicture:")
-        guard controller.responds(to: presentSelector) else {
-            return false
-        }
-
-        ensurePrivatePiPDelegateProtocolConformance()
-        privatePiPController = controller
-        _ = callObjectSetter(on: controller, selectorName: "setDelegate:", value: self)
-        let defaultControls = callUInt64Getter(on: controller, selectorName: "controls") ?? 3
-        defaultPrivatePiPControls = defaultControls == 0 ? 3 : defaultControls
-        let defaultStyle = callIntGetter(on: controller, selectorName: "controlStyle") ?? 1
-        defaultPrivatePiPControlStyle = defaultStyle
-        applyPrivatePiPControlsConfiguration()
-        _ = updatePrivatePlaybackState(on: controller, isPlaying: true)
-        logPrivatePlaybackState(prefix: "[Float PiP] playback configured")
-        if let effectiveControls = callUInt64Getter(on: controller, selectorName: "controls"),
-           let effectiveStyle = callIntGetter(on: controller, selectorName: "controlStyle")
-        {
-            print("[Float PiP] controls configured default=\(defaultControls) requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle) defaultStyle=\(defaultStyle)")
-        }
-        controller.addObserver(self, forKeyPath: "playing", options: [.new], context: &privatePiPPlayingKVOContext)
-        isObservingPrivatePiPPlaying = true
-        applyPrivatePiPAspectConstraints()
-        return true
-    }
-
-    private func ensurePrivatePiPDelegateProtocolConformance() {
-        let cls: AnyClass = type(of: self)
-        for protocolName in ["PIPClientXPCProtocol", "PIPViewControllerDelegate"] {
-            guard let protocolRef = NSProtocolFromString(protocolName) else { continue }
-            if class_conformsToProtocol(cls, protocolRef) {
-                continue
-            }
-            _ = class_addProtocol(cls, protocolRef)
-        }
-
-        let clientConforms = NSProtocolFromString("PIPClientXPCProtocol").map { class_conformsToProtocol(cls, $0) } ?? false
-        let legacyConforms = NSProtocolFromString("PIPViewControllerDelegate").map { class_conformsToProtocol(cls, $0) } ?? false
-        print("[Float PiP] delegate conformance client=\(clientConforms) legacy=\(legacyConforms)")
-
-        for selectorName in [
-            "clientPIP:setPlaying:",
-            "clientPIP:action:",
-            "clientPIP:skipInterval:",
-            "pipActionPlay:",
-            "pipActionPause:",
-            "pipActionStop:",
-        ] {
-            let responds = responds(to: NSSelectorFromString(selectorName))
-            print("[Float PiP] delegate responds \(selectorName)=\(responds)")
-        }
-    }
-
-    private func attemptStartPiP() {
-        guard wantsStart else { return }
-        guard !privatePiPPresented else { return }
-        guard !isStartingPictureInPicture else { return }
-        guard let privatePiPController else { return }
-
-        let selectorName = "presentViewControllerAsPictureInPicture:"
-        guard privatePiPController.responds(to: NSSelectorFromString(selectorName)) else { return }
-
-        isStartingPictureInPicture = true
-        applyPrivatePiPAspectConstraints()
-
-        let didPresent = callObjectSetter(
-            on: privatePiPController,
-            selectorName: selectorName,
-            value: privatePiPContentViewController
+        let contentSource = AVPictureInPictureController.ContentSource(
+            sampleBufferDisplayLayer: sampleBufferDisplayLayer,
+            playbackDelegate: self
         )
 
-        isStartingPictureInPicture = false
-
-        guard didPresent else { return }
-        applyPrivatePiPControlsConfiguration()
-        _ = updatePrivatePlaybackState(on: privatePiPController, isPlaying: playbackIsPlaying)
-        callBoolSetter(on: privatePiPController, selectorName: "setPlaying:", value: playbackIsPlaying)
-        logPrivatePlaybackState(prefix: "[Float PiP] playback after present")
-        if let effectiveControls = callUInt64Getter(on: privatePiPController, selectorName: "controls"),
-           let effectiveStyle = callIntGetter(on: privatePiPController, selectorName: "controlStyle")
-        {
-            print("[Float PiP] controls after present requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle)")
-        }
-        handlePrivatePiPStateDidChange(isPresented: true, notifyExternalClose: false)
+        let controller = AVPictureInPictureController(contentSource: contentSource)
+        controller.delegate = self
+        controller.requiresLinearPlayback = false
+        pictureInPictureController = controller
     }
 
-    private func applyPrivatePiPControlsConfiguration() {
-        guard let controller = privatePiPController else { return }
-        callUInt64Setter(on: controller, selectorName: "setControls:", value: defaultPrivatePiPControls)
-        callIntSetter(on: controller, selectorName: "setControlStyle:", value: defaultPrivatePiPControlStyle)
-    }
-
-    private func applyPrivatePiPAspectConstraints() {
-        guard let controller = privatePiPController else { return }
-
-        let ratio = max(0.2, min(5.0, expectedVideoAspectRatio))
-        let aspectSize = CGSize(width: ratio, height: 1.0)
-
-        callBoolSetter(on: controller, selectorName: "setUserCanResize:", value: true)
-        callCGSizeSetter(on: controller, selectorName: "setAspectRatio:", value: aspectSize)
-    }
-
-    private func callCGSizeSetter(on controller: NSObject, selectorName: String, value: CGSize) {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return }
-
-        typealias Setter = @convention(c) (AnyObject, Selector, CGSize) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Setter.self)
-        fn(controller, selector, value)
-    }
-
-    private func callBoolSetter(on controller: NSObject, selectorName: String, value: Bool) {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return }
-
-        typealias Setter = @convention(c) (AnyObject, Selector, Bool) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Setter.self)
-        fn(controller, selector, value)
-    }
-
-    private func callIntSetter(on controller: NSObject, selectorName: String, value: Int) {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return }
-
-        typealias Setter = @convention(c) (AnyObject, Selector, Int) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Setter.self)
-        fn(controller, selector, value)
-    }
-
-    private func callUInt64Setter(on controller: NSObject, selectorName: String, value: UInt64) {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return }
-
-        typealias Setter = @convention(c) (AnyObject, Selector, UInt64) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Setter.self)
-        fn(controller, selector, value)
-    }
-
-    @discardableResult
-    private func callObjectSetter(on controller: NSObject, selectorName: String, value: AnyObject?) -> Bool {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return false }
-
-        typealias Setter = @convention(c) (AnyObject, Selector, AnyObject?) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Setter.self)
-        fn(controller, selector, value)
-        return true
-    }
-
-    @discardableResult
-    private func callVoidMethod(on controller: NSObject, selectorName: String) -> Bool {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return false }
-
-        typealias Method = @convention(c) (AnyObject, Selector) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Method.self)
-        fn(controller, selector)
-        return true
-    }
-
-    private func callObjectGetter(on controller: NSObject, selectorName: String) -> AnyObject? {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return nil }
-
-        typealias Getter = @convention(c) (AnyObject, Selector) -> AnyObject?
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Getter.self)
-        return fn(controller, selector)
-    }
-
-    private func callBoolGetter(on controller: NSObject, selectorName: String) -> Bool? {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return nil }
-
-        typealias Getter = @convention(c) (AnyObject, Selector) -> Bool
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Getter.self)
-        return fn(controller, selector)
-    }
-
-    private func callIntGetter(on controller: NSObject, selectorName: String) -> Int? {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return nil }
-
-        typealias Getter = @convention(c) (AnyObject, Selector) -> Int
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Getter.self)
-        return fn(controller, selector)
-    }
-
-    private func callUInt64Getter(on controller: NSObject, selectorName: String) -> UInt64? {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return nil }
-
-        typealias Getter = @convention(c) (AnyObject, Selector) -> UInt64
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Getter.self)
-        return fn(controller, selector)
-    }
-
-    private func updatePrivatePlaybackState(on controller: NSObject, isPlaying: Bool) -> Bool {
-        let selector = NSSelectorFromString("updatePlaybackStateUsingBlock:")
-        guard controller.responds(to: selector) else { return false }
-
-        let elapsed = currentPlaybackElapsedSeconds()
-        let block: @convention(block) (AnyObject) -> Void = { state in
-            guard let stateObject = state as? NSObject else { return }
-            self.callBoolSetter(on: stateObject, selectorName: "setMuted:", value: false)
-            self.callBoolSetter(on: stateObject, selectorName: "setRequiresLinearPlayback:", value: false)
-            let isLive = !self.playbackDurationSeconds.isFinite || self.playbackDurationSeconds <= 0
-            self.callIntSetter(on: stateObject, selectorName: "setContentType:", value: isLive ? 1 : 0)
-            self.callDoubleSetter(
-                on: stateObject,
-                selectorName: "setContentDuration:",
-                value: isLive ? 0 : self.playbackDurationSeconds
+    private func ensureInlineHostWindow() {
+        if inlineHostWindow == nil {
+            let frame = CGRect(origin: Constants.inlineHostOrigin, size: Constants.inlineHostSize)
+            let window = NSWindow(
+                contentRect: frame,
+                styleMask: [.borderless],
+                backing: .buffered,
+                defer: false
             )
-            self.callPlaybackTimingSetter(
-                on: stateObject,
-                selectorName: "setPlaybackRate:elapsedTime:timeControlStatus:",
-                playbackRate: isPlaying ? 1.0 : 0.0,
-                elapsedTime: elapsed,
-                timeControlStatus: isPlaying ? 2 : 0
-            )
+            window.isReleasedWhenClosed = false
+            window.hasShadow = false
+            window.isOpaque = false
+            window.backgroundColor = .clear
+            window.alphaValue = 0.01
+            window.ignoresMouseEvents = true
+            window.level = .floating
+            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+            window.contentView = inlineHostView
+            window.orderFrontRegardless()
+            inlineHostWindow = window
+            print("[Float PiP] inline host window prepared")
         }
 
-        return callObjectSetter(on: controller, selectorName: "updatePlaybackStateUsingBlock:", value: unsafeBitCast(block, to: AnyObject.self))
+        inlineHostView.wantsLayer = true
+        if let hostLayer = inlineHostView.layer, sampleBufferDisplayLayer.superlayer !== hostLayer {
+            sampleBufferDisplayLayer.removeFromSuperlayer()
+            hostLayer.addSublayer(sampleBufferDisplayLayer)
+            sampleBufferDisplayLayer.frame = hostLayer.bounds
+            sampleBufferDisplayLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            print("[Float PiP] sample layer attached to inline host")
+        }
     }
 
-    private func callDoubleSetter(on controller: NSObject, selectorName: String, value: Double) {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return }
+    private func attemptStart() {
+        guard wantsStart else { return }
+        guard hasRenderedFirstFrame else { return }
+        guard let pictureInPictureController else { return }
+        guard !pictureInPictureController.isPictureInPictureActive else {
+            stopStartRetry()
+            return
+        }
+        guard pictureInPictureController.isPictureInPicturePossible else {
+            if startAttemptCount == 0 || startAttemptCount % 20 == 0 {
+                print("[Float PiP] start deferred possible=\(pictureInPictureController.isPictureInPicturePossible)")
+            }
+            startAttemptCount += 1
+            return
+        }
 
-        typealias Setter = @convention(c) (AnyObject, Selector, Double) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Setter.self)
-        fn(controller, selector, value)
+        startAttemptCount = 0
+        print("[Float PiP] start requested")
+        pictureInPictureController.startPictureInPicture()
     }
 
-    private func callDoubleGetter(on controller: NSObject, selectorName: String) -> Double? {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return nil }
-
-        typealias Getter = @convention(c) (AnyObject, Selector) -> Double
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Getter.self)
-        return fn(controller, selector)
+    private func startStartRetryIfNeeded() {
+        guard startRetryTimer == nil else { return }
+        startRetryTimer = Timer.scheduledTimer(withTimeInterval: Constants.startRetryIntervalSeconds, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                guard self.wantsStart else {
+                    self.stopStartRetry()
+                    return
+                }
+                guard self.hasRenderedFirstFrame else { return }
+                self.attemptStart()
+            }
+        }
     }
 
-    private func callPlaybackTimingSetter(
-        on controller: NSObject,
-        selectorName: String,
-        playbackRate: Double,
-        elapsedTime: Double,
-        timeControlStatus: Int
-    ) {
-        let selector = NSSelectorFromString(selectorName)
-        guard controller.responds(to: selector) else { return }
+    private func stopStartRetry() {
+        startRetryTimer?.invalidate()
+        startRetryTimer = nil
+    }
 
-        typealias Setter = @convention(c) (AnyObject, Selector, Double, Double, Int) -> Void
-        let imp = controller.method(for: selector)
-        let fn = unsafeBitCast(imp, to: Setter.self)
-        fn(controller, selector, playbackRate, elapsedTime, timeControlStatus)
+    private func applyLayerGeometry(_ size: CGSize) {
+        guard let resolvedSize = sanitizeLayerSize(size) else { return }
+        let currentSize = sampleBufferDisplayLayer.bounds.size
+        if abs(currentSize.width - resolvedSize.width) < 0.5 && abs(currentSize.height - resolvedSize.height) < 0.5 {
+            return
+        }
+
+        sampleBufferDisplayLayer.bounds = CGRect(origin: .zero, size: resolvedSize)
+        sampleBufferDisplayLayer.position = CGPoint(x: resolvedSize.width * 0.5, y: resolvedSize.height * 0.5)
+    }
+
+    private func sanitizeLayerSize(_ size: CGSize) -> CGSize? {
+        guard size.width.isFinite, size.height.isFinite else { return nil }
+        guard size.width > 0, size.height > 0 else { return nil }
+
+        let sanitizedWidth = min(Constants.maxLayerDimension, max(Constants.minLayerDimension, size.width))
+        let sanitizedHeight = min(Constants.maxLayerDimension, max(Constants.minLayerDimension, size.height))
+        return CGSize(width: sanitizedWidth, height: sanitizedHeight)
     }
 
     private func updatePlaybackClock(isPlaying: Bool) {
@@ -461,268 +515,140 @@ final class NativePiPController: NSObject {
         return lowerBounded
     }
 
-    private func pushPlaybackStateToPiPController() {
-        guard let controller = privatePiPController else { return }
-        isUpdatingPlaybackStateProgrammatically = true
-        _ = updatePrivatePlaybackState(on: controller, isPlaying: playbackIsPlaying)
-        // Keep deprecated state in sync; some macOS builds still gate play/pause controls on it.
-        callBoolSetter(on: controller, selectorName: "setPlaying:", value: playbackIsPlaying)
-        isUpdatingPlaybackStateProgrammatically = false
-    }
-
-    private func forwardSeekCommand(interval: Double) {
-        guard interval.isFinite else { return }
-
-        playbackElapsedSeconds = clampElapsedTime(currentPlaybackElapsedSeconds() + interval)
-        playbackAnchorDate = playbackIsPlaying ? Date() : nil
-        pushPlaybackStateToPiPController()
-        onSeekCommand?(interval)
-    }
-
-    private func logPrivatePlaybackState(prefix: String) {
-        guard let controller = privatePiPController else { return }
-        guard let state = callObjectGetter(on: controller, selectorName: "playbackState") as? NSObject else { return }
-
-        let contentType = callIntGetter(on: state, selectorName: "contentType") ?? -1
-        let duration = callDoubleGetter(on: state, selectorName: "contentDuration") ?? -1
-        let elapsed = callDoubleGetter(on: state, selectorName: "elapsedTime") ?? -1
-        let rate = callDoubleGetter(on: state, selectorName: "playbackRate") ?? -1
-        let timeControlStatus = callIntGetter(on: state, selectorName: "timeControlStatus") ?? -1
-        print("\(prefix) contentType=\(contentType) duration=\(duration) elapsed=\(elapsed) rate=\(rate) status=\(timeControlStatus)")
-    }
-
-    private func dismissPrivatePictureInPicture(on controller: NSObject) -> Bool {
-        if callVoidMethod(on: controller, selectorName: "dismissPictureInPicture") {
-            return true
-        }
-        if callVoidMethod(on: controller, selectorName: "stopPictureInPicture") {
-            return true
-        }
-        let completion: @convention(block) () -> Void = {}
-        if callObjectSetter(
-            on: controller,
-            selectorName: "dismissPictureInPictureWithCompletionHandler:",
-            value: unsafeBitCast(completion, to: AnyObject.self)
-        ) {
-            return true
-        }
-        return false
-    }
-
-    private func handlePrivatePiPStateDidChange(isPresented: Bool, notifyExternalClose: Bool) {
-        privatePiPPresented = isPresented
-
-        if isPresented {
-            suppressPlaybackCommands = false
-            startPrivatePiPPanelObservation()
-            startPrivatePiPVisibilityWatchdog()
-            refreshPrivatePiPPanelFromController()
+    private func configurePlaybackTimebase() {
+        var createdTimebase: CMTimebase?
+        let status = CMTimebaseCreateWithSourceClock(
+            allocator: kCFAllocatorDefault,
+            sourceClock: CMClockGetHostTimeClock(),
+            timebaseOut: &createdTimebase
+        )
+        guard status == noErr, let createdTimebase else {
+            playbackTimebase = nil
+            sampleBufferDisplayLayer.controlTimebase = nil
+            print("[Float PiP] failed to create playback timebase status=\(status)")
             return
         }
 
-        suppressPlaybackCommands = true
-        stopPrivatePiPVisibilityWatchdog()
-        stopPrivatePiPPanelObservation()
-        if notifyExternalClose {
-            onPictureInPictureClosed?()
+        playbackTimebase = createdTimebase
+        sampleBufferDisplayLayer.controlTimebase = createdTimebase
+        syncPlaybackTimebase()
+    }
+
+    private func syncPlaybackTimebase() {
+        guard let playbackTimebase else { return }
+        let elapsedSeconds = clampElapsedTime(currentPlaybackElapsedSeconds())
+        CMTimebaseSetTime(
+            playbackTimebase,
+            time: CMTime(seconds: elapsedSeconds, preferredTimescale: 600)
+        )
+        CMTimebaseSetRate(playbackTimebase, rate: playbackIsPlaying ? 1.0 : 0.0)
+    }
+
+    private func resolvedFinitePlaybackDuration() -> Double {
+        if playbackDurationSeconds.isFinite, playbackDurationSeconds > 0 {
+            return playbackDurationSeconds
         }
-    }
-
-    private func startPrivatePiPPanelObservation() {
-        guard let controller = privatePiPController else { return }
-        guard !isObservingPrivatePiPPanel else { return }
-
-        controller.addObserver(self, forKeyPath: "panel", options: [.initial, .new], context: &privatePiPPanelKVOContext)
-        isObservingPrivatePiPPanel = true
-    }
-
-    private func stopPrivatePiPPanelObservation() {
-        if isObservingPrivatePiPPanel, let controller = privatePiPController {
-            controller.removeObserver(self, forKeyPath: "panel", context: &privatePiPPanelKVOContext)
-            isObservingPrivatePiPPanel = false
+        let elapsed = currentPlaybackElapsedSeconds()
+        if elapsed.isFinite, elapsed > 0 {
+            return max(elapsed + 3600, 3600)
         }
-
-        removePrivatePiPPanelCloseObserver()
-        privatePiPPanel = nil
+        return Constants.fallbackPlaybackDurationSeconds
     }
 
-    private func refreshPrivatePiPPanelFromController() {
-        let panel = currentPrivatePiPPanel()
-        updateObservedPrivatePiPPanel(panel)
+    private func fourCC(_ value: OSType) -> String {
+        let bytes: [UInt8] = [
+            UInt8((value >> 24) & 0xFF),
+            UInt8((value >> 16) & 0xFF),
+            UInt8((value >> 8) & 0xFF),
+            UInt8(value & 0xFF),
+        ]
+        let text = String(bytes: bytes, encoding: .ascii) ?? "????"
+        return "\(text)(\(value))"
+    }
+}
+
+extension NativePiPController: AVPictureInPictureControllerDelegate {
+    func pictureInPictureControllerDidStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        _ = pictureInPictureController
+        stopStartRetry()
+        startAttemptCount = 0
+        print("[Float PiP] didStart")
     }
 
-    private func startPrivatePiPVisibilityWatchdog() {
-        guard privatePiPVisibilityWatchdog == nil else { return }
-
-        privatePiPVisibilityWatchdog = Timer.scheduledTimer(withTimeInterval: Constants.visibilityWatchdogInterval, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.checkPrivatePiPVisibility()
-            }
-        }
-    }
-
-    private func stopPrivatePiPVisibilityWatchdog() {
-        privatePiPVisibilityWatchdog?.invalidate()
-        privatePiPVisibilityWatchdog = nil
-    }
-
-    private func checkPrivatePiPVisibility() {
-        guard privatePiPPresented else { return }
-
-        let panel = currentPrivatePiPPanel()
-        updateObservedPrivatePiPPanel(panel)
-
-        guard let panel else {
-            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
-            return
-        }
-
-        guard panel.isVisible else {
-            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
-            return
-        }
-    }
-
-    private func currentPrivatePiPPanel() -> NSWindow? {
-        guard let controller = privatePiPController else { return nil }
-        return callObjectGetter(on: controller, selectorName: "panel") as? NSWindow
-    }
-
-    private func updateObservedPrivatePiPPanel(_ panel: NSWindow?) {
-        guard privatePiPPanel !== panel else { return }
-
-        removePrivatePiPPanelCloseObserver()
-
-        privatePiPPanel = panel
-        guard let panel else { return }
-
-        privatePiPPanelCloseObserver = NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification,
-            object: panel,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handlePrivatePiPPanelWillClose()
-            }
-        }
-    }
-
-    private func handlePrivatePiPPanelWillClose() {
-        guard privatePiPPresented else { return }
-
-        handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
-    }
-
-    override func observeValue(
-        forKeyPath keyPath: String?,
-        of object: Any?,
-        change: [NSKeyValueChangeKey: Any]?,
-        context: UnsafeMutableRawPointer?
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        failedToStartPictureInPictureWithError error: Error
     ) {
-        if context == &privatePiPPlayingKVOContext {
-            guard !isUpdatingPlaybackStateProgrammatically else { return }
-            guard !suppressPlaybackCommands else { return }
-            guard let controller = privatePiPController else { return }
-            guard let isPlaying = callBoolGetter(on: controller, selectorName: "playing") else { return }
-            onPlaybackCommand?(isPlaying)
+        _ = pictureInPictureController
+        print("[Float PiP] failedToStart error=\(error.localizedDescription)")
+    }
+
+    func pictureInPictureControllerDidStopPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
+        _ = pictureInPictureController
+        print("[Float PiP] didStop")
+        stopStartRetry()
+        startAttemptCount = 0
+
+        if isStoppingProgrammatically {
+            isStoppingProgrammatically = false
             return
         }
+        onPictureInPictureClosed?()
+    }
+}
 
-        guard context == &privatePiPPanelKVOContext else {
-            super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
-            return
-        }
-
-        guard keyPath == "panel" else { return }
-        refreshPrivatePiPPanelFromController()
+extension NativePiPController: AVPictureInPictureSampleBufferPlaybackDelegate {
+    func pictureInPictureController(_ pictureInPictureController: AVPictureInPictureController, setPlaying playing: Bool) {
+        _ = pictureInPictureController
+        updatePlaybackState(playing)
+        onPlaybackCommand?(playing)
     }
 
-    @objc(clientPIP:setPlaying:)
-    func clientPIP(_ pipID: UInt32, setPlaying isPlaying: Bool) {
-        _ = pipID
-        forwardPlaybackCommand(isPlaying: isPlaying)
+    func pictureInPictureControllerTimeRangeForPlayback(_ pictureInPictureController: AVPictureInPictureController) -> CMTimeRange {
+        _ = pictureInPictureController
+        let durationSeconds = resolvedFinitePlaybackDuration()
+        return CMTimeRange(
+            start: .zero,
+            duration: CMTime(seconds: durationSeconds, preferredTimescale: 600)
+        )
     }
 
-    @objc(clientPIP:action:)
-    func clientPIP(_ pipID: UInt32, action: Int64) {
-        _ = pipID
-        switch action {
-        case 0:
-            forwardPlaybackCommand(isPlaying: !playbackIsPlaying)
-        case 1:
-            forwardPlaybackCommand(isPlaying: true)
-        case 2:
-            forwardPlaybackCommand(isPlaying: false)
-        default:
-            print("[Float PiP] unhandled action=\(action)")
-        }
+    func pictureInPictureControllerIsPlaybackPaused(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
+        _ = pictureInPictureController
+        return !playbackIsPlaying
     }
 
-    @objc(clientPIP:willCloseWithCompletion:)
-    func clientPIP(_ pipID: UInt32, willCloseWithCompletion completion: @escaping () -> Void) {
-        _ = pipID
-        suppressPlaybackCommands = true
-        completion()
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        didTransitionToRenderSize newRenderSize: CMVideoDimensions
+    ) {
+        _ = pictureInPictureController
+        let width = max(0, Int(newRenderSize.width))
+        let height = max(0, Int(newRenderSize.height))
+        print("[Float PiP] renderSize width=\(width) height=\(height)")
     }
 
-    @objc(clientPIP:setWindowContentRect:completion:)
-    func clientPIP(_ pipID: UInt32, setWindowContentRect rect: CGRect, completion: @escaping () -> Void) {
-        _ = pipID
-        _ = rect
-        completion()
+    func pictureInPictureController(
+        _ pictureInPictureController: AVPictureInPictureController,
+        skipByInterval skipInterval: CMTime,
+        completion completionHandler: @escaping () -> Void
+    ) {
+        _ = pictureInPictureController
+        defer { completionHandler() }
+
+        let intervalSeconds = skipInterval.seconds
+        guard intervalSeconds.isFinite else { return }
+
+        print("[Float PiP] seek intervalSeconds=\(intervalSeconds)")
+        playbackElapsedSeconds = clampElapsedTime(currentPlaybackElapsedSeconds() + intervalSeconds)
+        playbackAnchorDate = playbackIsPlaying ? Date() : nil
+        syncPlaybackTimebase()
+        pictureInPictureController.invalidatePlaybackState()
+        onSeekCommand?(intervalSeconds)
     }
 
-    @objc(clientPIP:setMicrophoneMuted:)
-    func clientPIP(_ pipID: UInt32, setMicrophoneMuted muted: Bool) {
-        _ = pipID
-        _ = muted
-    }
-
-    @objc(clientPIP:skipInterval:)
-    func clientPIP(_ pipID: UInt32, skipInterval interval: Double) {
-        _ = pipID
-        forwardSeekCommand(interval: interval)
-    }
-
-    @objc(pipAction:skipInterval:)
-    func pipAction(_ pip: Any?, skipInterval interval: Double) {
-        _ = pip
-        forwardSeekCommand(interval: interval)
-    }
-
-    // Legacy PIPViewControllerDelegate callbacks still used by some macOS builds.
-    @objc(pipActionPlay:)
-    func pipActionPlay(_ pip: Any?) {
-        _ = pip
-        forwardPlaybackCommand(isPlaying: true)
-    }
-
-    @objc(pipActionPause:)
-    func pipActionPause(_ pip: Any?) {
-        _ = pip
-        forwardPlaybackCommand(isPlaying: false)
-    }
-
-    @objc(pipActionStop:)
-    func pipActionStop(_ pip: Any?) {
-        _ = pip
-        suppressPlaybackCommands = true
-    }
-
-    private func forwardPlaybackCommand(isPlaying: Bool) {
-        guard !suppressPlaybackCommands else { return }
-        updatePlaybackClock(isPlaying: isPlaying)
-        pushPlaybackStateToPiPController()
-        onPlaybackCommand?(isPlaying)
-    }
-
-    private var shouldNotifyExternalClose: Bool {
-        !isStoppingPrivatePiPProgrammatically
-    }
-
-    private func removePrivatePiPPanelCloseObserver() {
-        guard let observer = privatePiPPanelCloseObserver else { return }
-        NotificationCenter.default.removeObserver(observer)
-        privatePiPPanelCloseObserver = nil
+    func pictureInPictureControllerShouldProhibitBackgroundAudioPlayback(_ pictureInPictureController: AVPictureInPictureController) -> Bool {
+        _ = pictureInPictureController
+        return false
     }
 }
