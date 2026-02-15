@@ -1,265 +1,23 @@
-#if canImport(WebKit)
 import AppKit
 import Darwin
 import Foundation
 import ObjectiveC.runtime
-import WebKit
 
 @MainActor
-final class NativeWebRTCReceiver: NSObject, WebRTCReceiver {
-    var onLocalIceCandidate: ((LocalIceCandidate) -> Void)?
-    var onStreamingChanged: ((Bool) -> Void)?
-    var onPlaybackCommand: ((Bool) -> Void)?
-    var onSeekCommand: ((Double) -> Void)?
-
-    private let scriptMessageName = "floatReceiverBridge"
-    private let pipController = NativePiPController()
-    private var currentTabId: Int?
-    private var currentVideoId: String?
-    private var isStopping = false
-
-    private var bridgeReady = false
-    private var debugLoggingEnabled = false
-    private lazy var messageHandlerProxy = WeakScriptMessageHandler(delegate: self)
-
-    override init() {
-        super.init()
-
-        pipController.onPictureInPictureClosed = { [weak self] in
-            self?.stop()
-        }
-        pipController.onPlaybackCommand = { [weak self] isPlaying in
-            self?.onPlaybackCommand?(isPlaying)
-        }
-        pipController.onSeekCommand = { [weak self] intervalSeconds in
-            self?.onSeekCommand?(intervalSeconds)
-        }
-
-        let userContentController = pipController.webView.configuration.userContentController
-        userContentController.add(messageHandlerProxy, name: scriptMessageName)
-
-        do {
-            let html = try Self.loadWebReceiverHTML()
-            pipController.loadReceiverPage(html)
-        } catch {
-            print("[Float WK] receiver.error failed to load receiver.html: \(error.localizedDescription)")
-        }
+final class NativePiPController: NSObject {
+    private enum Constants {
+        static let defaultHostSize = CGSize(width: 1280, height: 720)
+        static let visibilityWatchdogInterval: TimeInterval = 0.4
     }
 
-    func handleOffer(_ offer: OfferMessage) async throws -> String {
-        currentTabId = offer.tabId
-        currentVideoId = offer.videoId
-
-        try await waitForBridgeReady()
-
-        let result = try await pipController.webView.callAsyncJavaScript(
-            "return window.FloatReceiver.handleOffer(offerSdp);",
-            arguments: ["offerSdp": offer.sdp],
-            in: nil,
-            contentWorld: .page
-        )
-
-        guard let answerSDP = result as? String, !answerSDP.isEmpty else {
-            throw WebRTCReceiverError.peerConnectionUnavailable
-        }
-
-        pipController.requestStart()
-        onStreamingChanged?(true)
-
-        return answerSDP
-    }
-
-    func addRemoteIceCandidate(_ ice: IceMessage) async throws {
-        try await waitForBridgeReady()
-
-        let candidatePayload: [String: Any] = [
-            "candidate": ice.candidate,
-            "sdpMid": ice.sdpMid ?? NSNull(),
-            "sdpMLineIndex": ice.sdpMLineIndex ?? NSNull(),
-        ]
-
-        _ = try await pipController.webView.callAsyncJavaScript(
-            "return window.FloatReceiver.addIceCandidate(candidate);",
-            arguments: ["candidate": candidatePayload],
-            in: nil,
-            contentWorld: .page
-        )
-    }
-
-    func stop() {
-        guard !isStopping else { return }
-        isStopping = true
-        defer { isStopping = false }
-
-        currentTabId = nil
-        currentVideoId = nil
-        onStreamingChanged?(false)
-
-        pipController.webView.evaluateJavaScript("window.FloatReceiver && window.FloatReceiver.stop();", completionHandler: nil)
-        pipController.stop()
-    }
-
-    func updatePlaybackState(isPlaying: Bool) {
-        pipController.updatePlaybackState(isPlaying)
-    }
-
-    func updatePlaybackProgress(elapsedSeconds: Double?, durationSeconds: Double?) {
-        pipController.updatePlaybackProgress(elapsedSeconds: elapsedSeconds, durationSeconds: durationSeconds)
-    }
-
-    func setDebugLoggingEnabled(_ enabled: Bool) {
-        debugLoggingEnabled = enabled
-        applyDebugLoggingSettingToPage()
-    }
-
-    private func waitForBridgeReady() async throws {
-        if bridgeReady {
-            return
-        }
-
-        let timeoutDate = Date().addingTimeInterval(8)
-        while !bridgeReady {
-            if Date() >= timeoutDate {
-                throw WebRTCReceiverError.bridgeNotReady
-            }
-            try await Task.sleep(nanoseconds: 100_000_000)
-        }
-    }
-
-    private func markBridgeReady() {
-        bridgeReady = true
-        applyDebugLoggingSettingToPage()
-    }
-
-    private func applyDebugLoggingSettingToPage() {
-        let enabled = debugLoggingEnabled ? "true" : "false"
-        pipController.webView.evaluateJavaScript(
-            "window.FloatReceiver && window.FloatReceiver.setDebugLoggingEnabled(\(enabled));",
-            completionHandler: nil
-        )
-    }
-
-    private func formatDebugPayload(_ payload: Any?) -> String {
-        guard let payload else {
-            return "{}"
-        }
-
-        if let text = payload as? String {
-            return text
-        }
-
-        if let number = payload as? NSNumber {
-            return number.stringValue
-        }
-
-        if JSONSerialization.isValidJSONObject(payload),
-           let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
-           let text = String(data: data, encoding: .utf8) {
-            return text
-        }
-
-        return String(describing: payload)
-    }
-
-    private func handleScriptMessage(_ body: Any) {
-        guard let payload = body as? [String: Any], let type = payload["type"] as? String else {
-            return
-        }
-
-        switch type {
-        case "ready":
-            markBridgeReady()
-            let secure = (payload["isSecureContext"] as? Bool) ?? false
-            let hasRTCPeerConnection = (payload["hasRTCPeerConnection"] as? Bool) ?? false
-            if debugLoggingEnabled {
-                print("[Float WK] receiver.ready secure=\(secure) hasRTCPeerConnection=\(hasRTCPeerConnection)")
-            }
-        case "localIce":
-            guard
-                let tabId = currentTabId,
-                let videoId = currentVideoId,
-                let candidate = payload["candidate"] as? String
-            else {
-                return
-            }
-
-            let local = LocalIceCandidate(
-                tabId: tabId,
-                videoId: videoId,
-                candidate: candidate,
-                sdpMid: payload["sdpMid"] as? String,
-                sdpMLineIndex: payload["sdpMLineIndex"] as? Int
-            )
-            onLocalIceCandidate?(local)
-        case "videoSize":
-            guard let width = payload["width"] as? Double,
-                  let height = payload["height"] as? Double,
-                  width > 0,
-                  height > 0
-            else {
-                return
-            }
-            pipController.updateExpectedVideoSize(CGSize(width: width, height: height))
-        case "streaming":
-            let isStreaming = (payload["isStreaming"] as? Bool) ?? false
-            onStreamingChanged?(isStreaming)
-            if isStreaming {
-                pipController.requestStart()
-            }
-        case "connectionState":
-            guard let state = payload["state"] as? String else { return }
-            if state == "failed" || state == "closed" || state == "disconnected" {
-                onStreamingChanged?(false)
-            }
-        case "error":
-            let reason = (payload["reason"] as? String) ?? "unknown"
-            print("[Float WK] receiver.error \(reason)")
-        case "debug":
-            guard debugLoggingEnabled else { return }
-            let event = (payload["event"] as? String) ?? "unknown"
-            let debugPayload = formatDebugPayload(payload["payload"])
-            print("[Float WK JS] \(event) payload=\(debugPayload)")
-        default:
-            break
-        }
-    }
-
-    private static func loadWebReceiverHTML() throws -> String {
-        guard let url = Bundle.main.url(forResource: "receiver", withExtension: "html") else {
-            throw WebRTCReceiverError.notConfigured
-        }
-        return try String(contentsOf: url, encoding: .utf8)
-    }
-}
-
-extension NativeWebRTCReceiver: WKScriptMessageHandler {
-    nonisolated func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.handleScriptMessage(message.body)
-        }
-    }
-}
-
-private final class WeakScriptMessageHandler: NSObject, WKScriptMessageHandler {
-    weak var delegate: WKScriptMessageHandler?
-
-    init(delegate: WKScriptMessageHandler?) {
-        self.delegate = delegate
-    }
-
-    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        delegate?.userContentController(userContentController, didReceive: message)
-    }
-}
-
-@MainActor
-private final class NativePiPController: NSObject {
     var onPictureInPictureClosed: (() -> Void)?
     var onPlaybackCommand: ((Bool) -> Void)?
     var onSeekCommand: ((Double) -> Void)?
 
-    let webView: WKWebView
+    private let hostView = NSView(
+        frame: CGRect(origin: .zero, size: Constants.defaultHostSize)
+    )
+    private weak var hostedContentView: NSView?
 
     private var privatePiPController: NSObject?
     private var privatePiPContentViewController = NSViewController()
@@ -288,11 +46,6 @@ private final class NativePiPController: NSObject {
     private var playbackDurationSeconds: Double = 0
 
     override init() {
-        let configuration = WKWebViewConfiguration()
-        configuration.mediaTypesRequiringUserActionForPlayback = []
-        configuration.allowsAirPlayForMediaPlayback = false
-
-        webView = WKWebView(frame: .zero, configuration: configuration)
         super.init()
         setupIfNeeded()
     }
@@ -304,8 +57,21 @@ private final class NativePiPController: NSObject {
         }
     }
 
-    func loadReceiverPage(_ html: String) {
-        webView.loadHTMLString(html, baseURL: URL(string: "https://float.local/"))
+    func setContentView(_ view: NSView) {
+        if hostedContentView === view {
+            return
+        }
+
+        hostedContentView?.removeFromSuperview()
+        hostedContentView = view
+        view.translatesAutoresizingMaskIntoConstraints = false
+        hostView.addSubview(view)
+        NSLayoutConstraint.activate([
+            view.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: hostView.trailingAnchor),
+            view.topAnchor.constraint(equalTo: hostView.topAnchor),
+            view.bottomAnchor.constraint(equalTo: hostView.bottomAnchor),
+        ])
     }
 
     func requestStart() {
@@ -372,7 +138,6 @@ private final class NativePiPController: NSObject {
     private func setupIfNeeded() {
         guard privatePiPController == nil else { return }
 
-        webView.translatesAutoresizingMaskIntoConstraints = false
         setupPrivatePiPHostView()
 
         if !setupPrivatePiPController() {
@@ -381,16 +146,10 @@ private final class NativePiPController: NSObject {
     }
 
     private func setupPrivatePiPHostView() {
-        let hostView = NSView(frame: CGRect(x: 0, y: 0, width: 1280, height: 720))
         hostView.wantsLayer = true
-        hostView.addSubview(webView)
-
-        NSLayoutConstraint.activate([
-            webView.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
-            webView.trailingAnchor.constraint(equalTo: hostView.trailingAnchor),
-            webView.topAnchor.constraint(equalTo: hostView.topAnchor),
-            webView.bottomAnchor.constraint(equalTo: hostView.bottomAnchor),
-        ])
+        if hostView.layer?.backgroundColor == nil {
+            hostView.layer?.backgroundColor = NSColor.black.cgColor
+        }
 
         privatePiPContentViewController = NSViewController()
         privatePiPContentViewController.view = hostView
@@ -783,11 +542,7 @@ private final class NativePiPController: NSObject {
             isObservingPrivatePiPPanel = false
         }
 
-        if let observer = privatePiPPanelCloseObserver {
-            NotificationCenter.default.removeObserver(observer)
-            privatePiPPanelCloseObserver = nil
-        }
-
+        removePrivatePiPPanelCloseObserver()
         privatePiPPanel = nil
     }
 
@@ -799,7 +554,7 @@ private final class NativePiPController: NSObject {
     private func startPrivatePiPVisibilityWatchdog() {
         guard privatePiPVisibilityWatchdog == nil else { return }
 
-        privatePiPVisibilityWatchdog = Timer.scheduledTimer(withTimeInterval: 0.4, repeats: true) { [weak self] _ in
+        privatePiPVisibilityWatchdog = Timer.scheduledTimer(withTimeInterval: Constants.visibilityWatchdogInterval, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.checkPrivatePiPVisibility()
             }
@@ -818,14 +573,12 @@ private final class NativePiPController: NSObject {
         updateObservedPrivatePiPPanel(panel)
 
         guard let panel else {
-            let notifyExternalClose = !isStoppingPrivatePiPProgrammatically
-            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: notifyExternalClose)
+            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
             return
         }
 
         guard panel.isVisible else {
-            let notifyExternalClose = !isStoppingPrivatePiPProgrammatically
-            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: notifyExternalClose)
+            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
             return
         }
     }
@@ -838,10 +591,7 @@ private final class NativePiPController: NSObject {
     private func updateObservedPrivatePiPPanel(_ panel: NSWindow?) {
         guard privatePiPPanel !== panel else { return }
 
-        if let observer = privatePiPPanelCloseObserver {
-            NotificationCenter.default.removeObserver(observer)
-            privatePiPPanelCloseObserver = nil
-        }
+        removePrivatePiPPanelCloseObserver()
 
         privatePiPPanel = panel
         guard let panel else { return }
@@ -860,8 +610,7 @@ private final class NativePiPController: NSObject {
     private func handlePrivatePiPPanelWillClose() {
         guard privatePiPPresented else { return }
 
-        let notifyExternalClose = !isStoppingPrivatePiPProgrammatically
-        handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: notifyExternalClose)
+        handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
     }
 
     override func observeValue(
@@ -897,20 +646,16 @@ private final class NativePiPController: NSObject {
     @objc(clientPIP:action:)
     func clientPIP(_ pipID: UInt32, action: Int64) {
         _ = pipID
-        if action == 0 {
+        switch action {
+        case 0:
             forwardPlaybackCommand(isPlaying: !playbackIsPlaying)
-            return
-        }
-        if action == 1 {
+        case 1:
             forwardPlaybackCommand(isPlaying: true)
-            return
-        }
-        if action == 2 {
+        case 2:
             forwardPlaybackCommand(isPlaying: false)
-            return
+        default:
+            print("[Float PiP] unhandled action=\(action)")
         }
-
-        print("[Float PiP] unhandled action=\(action)")
     }
 
     @objc(clientPIP:willCloseWithCompletion:)
@@ -970,5 +715,14 @@ private final class NativePiPController: NSObject {
         pushPlaybackStateToPiPController()
         onPlaybackCommand?(isPlaying)
     }
+
+    private var shouldNotifyExternalClose: Bool {
+        !isStoppingPrivatePiPProgrammatically
+    }
+
+    private func removePrivatePiPPanelCloseObserver() {
+        guard let observer = privatePiPPanelCloseObserver else { return }
+        NotificationCenter.default.removeObserver(observer)
+        privatePiPPanelCloseObserver = nil
+    }
 }
-#endif

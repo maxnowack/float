@@ -1014,14 +1014,19 @@ async function applyAnswer(videoId: string, sdp: string): Promise<void> {
     return;
   }
 
+  const answerOpusFmtpBefore = extractOpusFmtpLinesFromSdp(sdp);
+  const stereoAnswerSdp = enforceStereoOpusInOfferSdp(sdp, videoId);
+  const answerOpusFmtpAfter = extractOpusFmtpLinesFromSdp(stereoAnswerSdp);
+
   debugLog("sender.answer.audioSdp", {
     videoId,
-    opusFmtp: extractOpusFmtpLinesFromSdp(sdp),
+    before: answerOpusFmtpBefore,
+    after: answerOpusFmtpAfter,
   });
 
   await activePeer.setRemoteDescription({
     type: "answer",
-    sdp,
+    sdp: stereoAnswerSdp,
   });
 }
 
