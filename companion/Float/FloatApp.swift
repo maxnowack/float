@@ -135,6 +135,27 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
             menu.addItem(stopItem)
             menu.addItem(.separator())
         }
+
+        let autoStartItem = NSMenuItem(
+            title: "Auto-start PiP",
+            action: #selector(handleAutoStartBackgroundToggled(_:)),
+            keyEquivalent: ""
+        )
+        autoStartItem.target = self
+        autoStartItem.state = signalingServer.autoStartBackgroundEnabled ? .on : .off
+        menu.addItem(autoStartItem)
+
+        let autoStopItem = NSMenuItem(
+            title: "Auto-stop PiP",
+            action: #selector(handleAutoStopForegroundToggled(_:)),
+            keyEquivalent: ""
+        )
+        autoStopItem.target = self
+        autoStopItem.state = signalingServer.autoStopForegroundEnabled ? .on : .off
+        menu.addItem(autoStopItem)
+
+        menu.addItem(.separator())
+
         let quitItem = NSMenuItem(title: "Quit Float", action: #selector(handleQuit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -158,6 +179,18 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
     @objc private func handleStopRequested() {
         signalingServer.requestStop()
+    }
+
+    @objc private func handleAutoStartBackgroundToggled(_ sender: NSMenuItem) {
+        let enabled = sender.state != .on
+        signalingServer.setAutoStartBackgroundEnabled(enabled)
+        sender.state = enabled ? .on : .off
+    }
+
+    @objc private func handleAutoStopForegroundToggled(_ sender: NSMenuItem) {
+        let enabled = sender.state != .on
+        signalingServer.setAutoStopForegroundEnabled(enabled)
+        sender.state = enabled ? .on : .off
     }
 
     func menuDidClose(_ menu: NSMenu) {

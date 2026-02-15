@@ -20,9 +20,17 @@ let activeStream: MediaStream | null = null;
 let activeVideoId: string | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
 let sourceProbeTimerId: number | null = null;
+let didNotifyBackgroundSinceForeground = false;
 const FLOAT_TARGET_WIDTH = 1280;
 const FLOAT_TARGET_HEIGHT = 720;
 const FLOAT_TARGET_FPS = 30;
+const isTopFrame = (() => {
+  try {
+    return window.top === window;
+  } catch {
+    return false;
+  }
+})();
 
 function debugLog(event: string, payload?: Record<string, unknown>): void {
   if (typeof payload === "undefined") {
@@ -111,6 +119,46 @@ function emitState(): void {
   chrome.runtime.sendMessage(payload);
 }
 
+function notifyTabBackgrounded(trigger: string): void {
+  if (!isTopFrame || didNotifyBackgroundSinceForeground) {
+    return;
+  }
+
+  didNotifyBackgroundSinceForeground = true;
+  chrome.runtime.sendMessage({
+    type: "float:tab:background",
+    trigger,
+    page: {
+      title: document.title,
+      url: location.href,
+    },
+    visibilityState: document.visibilityState,
+    hasFocus: document.hasFocus(),
+  });
+}
+
+function notifyTabForegrounded(trigger: string): void {
+  if (!isTopFrame || !didNotifyBackgroundSinceForeground) {
+    return;
+  }
+
+  didNotifyBackgroundSinceForeground = false;
+  chrome.runtime.sendMessage({
+    type: "float:tab:foreground",
+    trigger,
+    page: {
+      title: document.title,
+      url: location.href,
+    },
+    visibilityState: document.visibilityState,
+    hasFocus: document.hasFocus(),
+  });
+}
+
+function markTabForegrounded(): void {
+  didNotifyBackgroundSinceForeground = false;
+}
+
 function scheduleEmit(): void {
   if (scheduled) {
     return;
@@ -165,6 +213,35 @@ observer.observe(document.documentElement, {
 refreshVideoWatchers();
 scheduleEmit();
 window.setInterval(scheduleEmit, 2000);
+if (isTopFrame) {
+  window.addEventListener(
+    "blur",
+    () => {
+      notifyTabBackgrounded("window.blur");
+    },
+    { passive: true },
+  );
+
+  window.addEventListener(
+    "focus",
+    () => {
+      notifyTabForegrounded("window.focus");
+    },
+    { passive: true },
+  );
+
+  document.addEventListener(
+    "visibilitychange",
+    () => {
+      if (document.visibilityState === "hidden") {
+        notifyTabBackgrounded("document.visibilitychange.hidden");
+        return;
+      }
+      notifyTabForegrounded("document.visibilitychange.visible");
+    },
+    { passive: true },
+  );
+}
 window.addEventListener("beforeunload", () => {
   stopStreaming();
   chrome.runtime.sendMessage({

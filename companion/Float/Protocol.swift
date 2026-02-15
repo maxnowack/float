@@ -13,6 +13,8 @@ enum FloatProtocol {
         static let stop = "stop"
         static let playback = "playback"
         static let seek = "seek"
+        static let autoStartBackground = "autoStartBackground"
+        static let autoStopForeground = "autoStopForeground"
         static let error = "error"
         static let debug = "debug"
     }

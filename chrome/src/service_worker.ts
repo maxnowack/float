@@ -40,6 +40,8 @@ let reconnectTimer: number | null = null;
 let activeStreamTarget: { tabId: number; videoId: string } | null = null;
 let mutedTabState: MutedTabState | null = null;
 let desiredMutedTabId: number | null = null;
+let autoStartBackgroundEnabled = false;
+let autoStopForegroundEnabled = true;
 
 function log(message: string, payload?: unknown): void {
   if (!debugLogEnabled) {
@@ -109,6 +111,79 @@ function sendSocketMessage(payload: unknown): void {
 
 function sendProtocolError(reason: string): void {
   sendSocketMessage(FloatProtocolError(reason));
+}
+
+function chooseAutoStartVideo(videos: WorkerVideoCandidate[]): WorkerVideoCandidate | null {
+  if (videos.length === 0) {
+    return null;
+  }
+  const playingVideo = videos.find((video) => video.playing);
+  return playingVideo ?? videos[0] ?? null;
+}
+
+function sendStartToTab(tabId: number, videoId: string): void {
+  activeStreamTarget = { tabId, videoId };
+  desiredMutedTabId = tabId;
+
+  chrome.tabs.sendMessage(
+    tabId,
+    {
+      type: "float:start",
+      videoId,
+    },
+    () => {
+      if (!chrome.runtime.lastError) {
+        return;
+      }
+
+      log("Failed to send start message", chrome.runtime.lastError.message);
+      if (activeStreamTarget?.tabId === tabId && activeStreamTarget.videoId === videoId) {
+        activeStreamTarget = null;
+      }
+      if (desiredMutedTabId === tabId) {
+        desiredMutedTabId = null;
+      }
+      restoreMutedTabIfNeeded(tabId);
+    },
+  );
+}
+
+function maybeAutoStartBackgroundTab(tabId: number): void {
+  if (!autoStartBackgroundEnabled || activeStreamTarget) {
+    return;
+  }
+
+  const tabState = flattenTabState(tabId);
+  if (!tabState) {
+    return;
+  }
+
+  const candidate = chooseAutoStartVideo(tabState.videos);
+  if (!candidate) {
+    return;
+  }
+
+  sendStartToTab(tabId, candidate.videoId);
+}
+
+function stopStreamForForegroundTab(tabId: number): void {
+  if (!activeStreamTarget || activeStreamTarget.tabId !== tabId) {
+    return;
+  }
+
+  const sourceTabId = activeStreamTarget.tabId;
+  activeStreamTarget = null;
+  desiredMutedTabId = null;
+  restoreMutedTabIfNeeded(sourceTabId);
+
+  chrome.tabs.sendMessage(sourceTabId, { type: "float:stop" }, () => {
+    if (!chrome.runtime.lastError) {
+      return;
+    }
+
+    log("Failed to send stop message for foreground tab", chrome.runtime.lastError.message);
+    sendSocketMessage({ type: FloatProtocol.messageType.stop });
+  });
 }
 
 function unmuteTabIfNeeded(tabId: number): void {
@@ -398,12 +473,7 @@ function handleCompanionMessage(raw: unknown): void {
   }
 
   if (FloatProtocolIsStartMessage(parsed)) {
-    activeStreamTarget = { tabId: parsed.tabId, videoId: parsed.videoId };
-    desiredMutedTabId = parsed.tabId;
-    chrome.tabs.sendMessage(parsed.tabId, {
-      type: "float:start",
-      videoId: parsed.videoId,
-    });
+    sendStartToTab(parsed.tabId, parsed.videoId);
     return;
   }
 
@@ -418,6 +488,16 @@ function handleCompanionMessage(raw: unknown): void {
         }
       });
     });
+    return;
+  }
+
+  if (FloatProtocolIsAutoStartBackgroundMessage(parsed)) {
+    autoStartBackgroundEnabled = parsed.enabled;
+    return;
+  }
+
+  if (FloatProtocolIsAutoStopForegroundMessage(parsed)) {
+    autoStopForegroundEnabled = parsed.enabled;
     return;
   }
 
@@ -482,6 +562,20 @@ chrome.runtime.onMessage.addListener((message: any, sender: any) => {
 
   if (message.type === "float:videos:clear") {
     onVideosClear(sender);
+    return;
+  }
+
+  if (message.type === "float:tab:background") {
+    if (sender?.frameId === 0 && typeof sender?.tab?.id === "number") {
+      maybeAutoStartBackgroundTab(sender.tab.id);
+    }
+    return;
+  }
+
+  if (message.type === "float:tab:foreground") {
+    if (autoStopForegroundEnabled && sender?.frameId === 0 && typeof sender?.tab?.id === "number") {
+      stopStreamForForegroundTab(sender.tab.id);
+    }
     return;
   }
 

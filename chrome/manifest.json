@@ -4,7 +4,6 @@
   "version": "0.1.0",
   "description": "Detects playing videos and coordinates with the Float macOS companion.",
   "permissions": [
-    "storage",
     "tabs"
   ],
   "host_permissions": [

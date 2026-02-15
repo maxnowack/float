@@ -13,6 +13,8 @@ if (!globalScope.FloatProtocol) {
       stop: "stop",
       playback: "playback",
       seek: "seek",
+      autoStartBackground: "autoStartBackground",
+      autoStopForeground: "autoStopForeground",
       error: "error",
       debug: "debug",
     },
@@ -48,6 +50,32 @@ function isStartMessage(message: unknown): message is { type: "start"; tabId: nu
 
 function isStopMessage(message: unknown): message is { type: "stop" } {
   return isUnknownRecord(message) && message.type === FloatProtocol.messageType.stop;
+}
+
+function isAutoStartBackgroundMessage(
+  message: unknown,
+): message is { type: "autoStartBackground"; enabled: boolean } {
+  if (!isUnknownRecord(message)) {
+    return false;
+  }
+
+  return (
+    message.type === FloatProtocol.messageType.autoStartBackground &&
+    typeof message.enabled === "boolean"
+  );
+}
+
+function isAutoStopForegroundMessage(
+  message: unknown,
+): message is { type: "autoStopForeground"; enabled: boolean } {
+  if (!isUnknownRecord(message)) {
+    return false;
+  }
+
+  return (
+    message.type === FloatProtocol.messageType.autoStopForeground &&
+    typeof message.enabled === "boolean"
+  );
 }
 
 function isPlaybackMessage(
@@ -132,6 +160,8 @@ function asErrorMessage(reason: string): { type: "error"; reason: string } {
 globalScope.FloatProtocolReadTypeField = readTypeField;
 globalScope.FloatProtocolIsStartMessage = isStartMessage;
 globalScope.FloatProtocolIsStopMessage = isStopMessage;
+globalScope.FloatProtocolIsAutoStartBackgroundMessage = isAutoStartBackgroundMessage;
+globalScope.FloatProtocolIsAutoStopForegroundMessage = isAutoStopForegroundMessage;
 globalScope.FloatProtocolIsPlaybackMessage = isPlaybackMessage;
 globalScope.FloatProtocolIsSeekMessage = isSeekMessage;
 globalScope.FloatProtocolIsAnswerMessage = isAnswerMessage;

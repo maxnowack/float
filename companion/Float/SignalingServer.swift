@@ -40,6 +40,8 @@ final class SignalingServer: ObservableObject {
     }
 
     static let port: UInt16 = 17891
+    private static let autoStartBackgroundDefaultsKey = "Float.autoStartBackgroundEnabled"
+    private static let autoStopForegroundDefaultsKey = "Float.autoStopForegroundEnabled"
 
     @Published private(set) var serverState: ServerState = .starting
     @Published private(set) var tabs: [TabState] = []
@@ -47,6 +49,8 @@ final class SignalingServer: ObservableObject {
     @Published private(set) var lastHelloVersion: Int?
     @Published private(set) var isStreaming = false
     @Published private(set) var lastExtensionDebugLog: String?
+    @Published private(set) var autoStartBackgroundEnabled = false
+    @Published private(set) var autoStopForegroundEnabled = true
 
     struct VideoSource: Identifiable {
         let tabId: Int
@@ -88,6 +92,8 @@ final class SignalingServer: ObservableObject {
     private var stopRequestInFlight = false
 
     init() {
+        autoStartBackgroundEnabled = UserDefaults.standard.object(forKey: Self.autoStartBackgroundDefaultsKey) as? Bool ?? false
+        autoStopForegroundEnabled = UserDefaults.standard.object(forKey: Self.autoStopForegroundDefaultsKey) as? Bool ?? true
         var receiver = makeWebRTCReceiver()
         self.webRTCReceiver = receiver
         receiver.onLocalIceCandidate = { [weak self] candidate in
@@ -203,6 +209,26 @@ final class SignalingServer: ObservableObject {
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])
     }
 
+    func setAutoStartBackgroundEnabled(_ enabled: Bool) {
+        guard autoStartBackgroundEnabled != enabled else {
+            return
+        }
+
+        autoStartBackgroundEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.autoStartBackgroundDefaultsKey)
+        broadcastAutoStartBackgroundSetting()
+    }
+
+    func setAutoStopForegroundEnabled(_ enabled: Bool) {
+        guard autoStopForegroundEnabled != enabled else {
+            return
+        }
+
+        autoStopForegroundEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: Self.autoStopForegroundDefaultsKey)
+        broadcastAutoStopForegroundSetting()
+    }
+
     func isActiveSource(_ source: VideoSource) -> Bool {
         source.tabId == activeTabId && source.videoId == activeVideoId
     }
@@ -310,6 +336,8 @@ final class SignalingServer: ObservableObject {
                     "type": FloatProtocol.MessageType.hello,
                     "version": FloatProtocol.version,
                 ])
+                sendAutoStartBackgroundSetting(to: clientID)
+                sendAutoStopForegroundSetting(to: clientID)
             case FloatProtocol.MessageType.state:
                 let state = try decoder.decode(StateMessage.self, from: data)
                 Task { @MainActor in
@@ -520,6 +548,38 @@ final class SignalingServer: ObservableObject {
             return
         }
         sendEncodable(value, to: clientID)
+    }
+
+    private func sendAutoStartBackgroundSetting(to clientID: UUID) {
+        sendToClient(clientID, payload: [
+            "type": FloatProtocol.MessageType.autoStartBackground,
+            "enabled": autoStartBackgroundEnabled,
+        ])
+    }
+
+    private func broadcastAutoStartBackgroundSetting() {
+        let clientIDs = Array(clients.keys)
+        guard !clientIDs.isEmpty else {
+            return
+        }
+
+        clientIDs.forEach { sendAutoStartBackgroundSetting(to: $0) }
+    }
+
+    private func sendAutoStopForegroundSetting(to clientID: UUID) {
+        sendToClient(clientID, payload: [
+            "type": FloatProtocol.MessageType.autoStopForeground,
+            "enabled": autoStopForegroundEnabled,
+        ])
+    }
+
+    private func broadcastAutoStopForegroundSetting() {
+        let clientIDs = Array(clients.keys)
+        guard !clientIDs.isEmpty else {
+            return
+        }
+
+        clientIDs.forEach { sendAutoStopForegroundSetting(to: $0) }
     }
 
     private func log(_ message: String) {

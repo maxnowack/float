@@ -12,6 +12,8 @@ type FloatProtocolShape = {
     stop: "stop";
     playback: "playback";
     seek: "seek";
+    autoStartBackground: "autoStartBackground";
+    autoStopForeground: "autoStopForeground";
     error: "error";
     debug: "debug";
   };
@@ -23,6 +25,12 @@ declare var FloatProtocolIsStartMessage: (
   message: unknown,
 ) => message is { type: "start"; tabId: number; videoId: string };
 declare var FloatProtocolIsStopMessage: (message: unknown) => message is { type: "stop" };
+declare var FloatProtocolIsAutoStartBackgroundMessage: (
+  message: unknown,
+) => message is { type: "autoStartBackground"; enabled: boolean };
+declare var FloatProtocolIsAutoStopForegroundMessage: (
+  message: unknown,
+) => message is { type: "autoStopForeground"; enabled: boolean };
 declare var FloatProtocolIsPlaybackMessage: (
   message: unknown,
 ) => message is { type: "playback"; tabId: number; videoId: string; playing: boolean };
