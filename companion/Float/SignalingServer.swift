@@ -33,9 +33,9 @@ final class SignalingServer: ObservableObject {
         var symbolName: String {
             switch self {
             case .extensionNotConnected:
-                return "cable.connector.slash"
+                return "rectangle.slash"
             case .extensionConnectedNoVideo:
-                return "pip.remove"
+                return "rectangle"
             case .extensionConnectedOneVideo:
                 return "pip"
             case .extensionConnectedMultipleVideos:
