@@ -160,6 +160,15 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         receiverLogsItem.state = signalingServer.receiverDebugLoggingEnabled ? .on : .off
         menu.addItem(receiverLogsItem)
 
+        let fpsOverlayItem = NSMenuItem(
+            title: "FPS Overlay",
+            action: #selector(handleFPSOverlayToggled(_:)),
+            keyEquivalent: ""
+        )
+        fpsOverlayItem.target = self
+        fpsOverlayItem.state = signalingServer.diagnosticsOverlayEnabled ? .on : .off
+        menu.addItem(fpsOverlayItem)
+
         menu.addItem(.separator())
 
         let quitItem = NSMenuItem(title: "Quit Float", action: #selector(handleQuit), keyEquivalent: "q")
@@ -208,6 +217,12 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     @objc private func handleReceiverLogsToggled(_ sender: NSMenuItem) {
         let enabled = sender.state != .on
         signalingServer.setReceiverDebugLoggingEnabled(enabled)
+        sender.state = enabled ? .on : .off
+    }
+
+    @objc private func handleFPSOverlayToggled(_ sender: NSMenuItem) {
+        let enabled = sender.state != .on
+        signalingServer.setDiagnosticsOverlayEnabled(enabled)
         sender.state = enabled ? .on : .off
     }
 

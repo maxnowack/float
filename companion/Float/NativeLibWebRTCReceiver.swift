@@ -16,11 +16,19 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private static let terminalConnectionStates: Set<RTCPeerConnectionState> = [
         .disconnected, .failed, .closed,
     ]
+    private static let statsProbeIntervalSeconds: TimeInterval = 1.0
+    private static let fpsSmoothingAlpha: Double = 0.28
+
+    private struct VideoInboundSnapshot {
+        let framesDecoded: Double
+        let sampleTime: Date
+    }
 
     var onLocalIceCandidate: ((LocalIceCandidate) -> Void)?
     var onStreamingChanged: ((Bool) -> Void)?
     var onPlaybackCommand: ((Bool) -> Void)?
     var onSeekCommand: ((Double) -> Void)?
+    var onPiPRenderSizeChanged: ((CGSize) -> Void)?
 
     private static var didInitializeSSL = false
     private static var didInitializeFieldTrials = false
@@ -40,7 +48,11 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private var currentVideoId: String?
     private var isStopping = false
     private var debugLoggingEnabled = false
+    private var diagnosticsOverlayEnabled = true
     private var statsProbeTimer: Timer?
+    private var lastVideoInboundSnapshot: VideoInboundSnapshot?
+    private var smoothedVideoFPS: Double?
+    private var lastReportedVideoSize = CGSize.zero
 
     override init() {
         if !Self.didInitializeFieldTrials {
@@ -75,6 +87,9 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
         pipController.onSeekCommand = { [weak self] intervalSeconds in
             self?.onSeekCommand?(intervalSeconds)
+        }
+        pipController.onPiPRenderSizeChanged = { [weak self] size in
+            self?.onPiPRenderSizeChanged?(size)
         }
     }
 
@@ -153,8 +168,24 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         debugLoggingEnabled = enabled
         if enabled {
             startStatsProbeIfNeeded()
-        } else {
+        } else if !diagnosticsOverlayEnabled {
             stopStatsProbe()
+        }
+    }
+
+    func setDiagnosticsOverlayEnabled(_ enabled: Bool) {
+        guard diagnosticsOverlayEnabled != enabled else {
+            return
+        }
+
+        diagnosticsOverlayEnabled = enabled
+        if enabled {
+            startStatsProbeIfNeeded()
+        } else {
+            pipController.updateDiagnosticsOverlay(nil)
+            if !debugLoggingEnabled {
+                stopStatsProbe()
+            }
         }
     }
 
@@ -181,6 +212,10 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private func clearActivePeerConnection(notifyStreamingStopped: Bool) {
         stopStatsProbe()
         pendingRemoteCandidates.removeAll()
+        lastVideoInboundSnapshot = nil
+        smoothedVideoFPS = nil
+        lastReportedVideoSize = .zero
+        pipController.updateDiagnosticsOverlay(nil)
 
         if let remoteVideoTrack {
             remoteVideoTrack.remove(videoView)
@@ -212,6 +247,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         remoteVideoTrack = track
         track.isEnabled = true
         track.add(videoView)
+        startStatsProbeIfNeeded()
         pipController.requestStart()
         onStreamingChanged?(true)
 
@@ -468,15 +504,16 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func startStatsProbeIfNeeded() {
-        guard debugLoggingEnabled else { return }
+        guard diagnosticsOverlayEnabled || debugLoggingEnabled else { return }
         guard peerConnection != nil else { return }
         guard statsProbeTimer == nil else { return }
 
-        statsProbeTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+        statsProbeTimer = Timer.scheduledTimer(withTimeInterval: Self.statsProbeIntervalSeconds, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
-                self?.collectReceiverAudioStats()
+                self?.collectReceiverStats()
             }
         }
+        collectReceiverStats()
     }
 
     private func stopStatsProbe() {
@@ -484,16 +521,141 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         statsProbeTimer = nil
     }
 
-    private func collectReceiverAudioStats() {
-        guard debugLoggingEnabled else { return }
+    private func collectReceiverStats() {
         guard let connection = peerConnection else { return }
 
         connection.statistics { [weak self] report in
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.logReceiverAudioStats(report)
+                self.updateVideoDiagnosticsOverlay(using: report)
+                if self.debugLoggingEnabled {
+                    self.logReceiverAudioStats(report)
+                }
             }
         }
+    }
+
+    private func updateVideoDiagnosticsOverlay(using report: RTCStatisticsReport) {
+        guard diagnosticsOverlayEnabled else {
+            pipController.updateDiagnosticsOverlay(nil)
+            return
+        }
+
+        guard remoteVideoTrack != nil else {
+            pipController.updateDiagnosticsOverlay(nil)
+            return
+        }
+
+        var selectedStat: RTCStatistics?
+        for (_, stat) in report.statistics where stat.type == "inbound-rtp" {
+            let values = stat.values
+            let kind = (values["kind"] as? String) ?? (values["mediaType"] as? String)
+            if kind == "video" {
+                selectedStat = stat
+                break
+            }
+        }
+
+        guard let selectedStat else {
+            pipController.updateDiagnosticsOverlay(nil)
+            return
+        }
+
+        let values = selectedStat.values
+        let reportedFPS = readDoubleStatValue(values["framesPerSecond"])
+        let framesDecoded = readDoubleStatValue(values["framesDecoded"])
+        let frameWidth = readIntStatValue(values["frameWidth"])
+        let frameHeight = readIntStatValue(values["frameHeight"])
+        let now = Date()
+
+        let resolvedFPS = resolveReceiverFPS(
+            reportedFPS: reportedFPS,
+            framesDecoded: framesDecoded,
+            sampleTime: now
+        )
+        let resolvedWidth = frameWidth ?? fallbackVideoDimension(lastReportedVideoSize.width)
+        let resolvedHeight = frameHeight ?? fallbackVideoDimension(lastReportedVideoSize.height)
+
+        let fpsText = resolvedFPS.map { String(format: "FPS %.1f", $0) } ?? "FPS --"
+        var overlayText = fpsText
+        if let resolvedWidth, let resolvedHeight, resolvedWidth > 0, resolvedHeight > 0 {
+            overlayText += " | \(resolvedWidth)x\(resolvedHeight)"
+        }
+
+        pipController.updateDiagnosticsOverlay(overlayText)
+
+        if debugLoggingEnabled {
+            let fpsValue = resolvedFPS.map { String(format: "%.2f", $0) } ?? "null"
+            let widthValue = resolvedWidth.map(String.init) ?? "null"
+            let heightValue = resolvedHeight.map(String.init) ?? "null"
+            log(
+                "receiver.stats.video fps=\(fpsValue) width=\(widthValue) height=\(heightValue)"
+            )
+        }
+    }
+
+    private func resolveReceiverFPS(
+        reportedFPS: Double?,
+        framesDecoded: Double?,
+        sampleTime: Date
+    ) -> Double? {
+        var nextMeasuredFPS: Double? = nil
+        if let reportedFPS, reportedFPS.isFinite, reportedFPS >= 0 {
+            nextMeasuredFPS = reportedFPS
+        } else if let framesDecoded, framesDecoded.isFinite, framesDecoded >= 0,
+                  let previous = lastVideoInboundSnapshot
+        {
+            let deltaFrames = framesDecoded - previous.framesDecoded
+            let deltaTime = sampleTime.timeIntervalSince(previous.sampleTime)
+            if deltaFrames >= 0, deltaTime > 0 {
+                nextMeasuredFPS = deltaFrames / deltaTime
+            }
+        }
+
+        if let framesDecoded, framesDecoded.isFinite, framesDecoded >= 0 {
+            lastVideoInboundSnapshot = VideoInboundSnapshot(framesDecoded: framesDecoded, sampleTime: sampleTime)
+        } else {
+            lastVideoInboundSnapshot = nil
+        }
+
+        guard let nextMeasuredFPS, nextMeasuredFPS.isFinite, nextMeasuredFPS >= 0 else {
+            return smoothedVideoFPS
+        }
+
+        let boundedFPS = min(240, max(0, nextMeasuredFPS))
+        if let current = smoothedVideoFPS {
+            smoothedVideoFPS = (current * (1 - Self.fpsSmoothingAlpha)) + (boundedFPS * Self.fpsSmoothingAlpha)
+        } else {
+            smoothedVideoFPS = boundedFPS
+        }
+        return smoothedVideoFPS
+    }
+
+    private func readDoubleStatValue(_ value: NSObject?) -> Double? {
+        if let number = value as? NSNumber {
+            return number.doubleValue
+        }
+        if let string = value as? String {
+            return Double(string)
+        }
+        return nil
+    }
+
+    private func readIntStatValue(_ value: NSObject?) -> Int? {
+        if let number = value as? NSNumber {
+            return number.intValue
+        }
+        if let string = value as? String, let intValue = Int(string) {
+            return intValue
+        }
+        return nil
+    }
+
+    private func fallbackVideoDimension(_ value: CGFloat) -> Int? {
+        guard value.isFinite, value > 0 else {
+            return nil
+        }
+        return Int(value.rounded())
     }
 
     private func logReceiverAudioStats(_ report: RTCStatisticsReport) {
@@ -642,6 +804,7 @@ extension NativeLibWebRTCReceiver: RTCVideoViewDelegate {
         Task { @MainActor [weak self] in
             guard let self else { return }
             guard size.width > 0, size.height > 0 else { return }
+            self.lastReportedVideoSize = size
             self.pipController.updateExpectedVideoSize(size)
             self.pipController.requestStart()
             self.onStreamingChanged?(true)

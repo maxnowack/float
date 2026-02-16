@@ -13,6 +13,7 @@ enum FloatProtocol {
         static let stop = "stop"
         static let playback = "playback"
         static let seek = "seek"
+        static let qualityHint = "qualityHint"
         static let autoStartBackground = "autoStartBackground"
         static let autoStopForeground = "autoStopForeground"
         static let error = "error"
@@ -60,6 +61,15 @@ struct OutgoingIceMessage: Encodable {
     let candidate: String
     let sdpMid: String?
     let sdpMLineIndex: Int?
+}
+
+struct QualityHintMessage: Encodable {
+    let type: String
+    let tabId: Int
+    let videoId: String
+    let profile: String
+    let pipWidth: Int?
+    let pipHeight: Int?
 }
 
 struct ErrorMessage: Decodable {

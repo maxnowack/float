@@ -538,6 +538,17 @@ function handleCompanionMessage(raw: unknown): void {
     return;
   }
 
+  if (FloatProtocolIsQualityHintMessage(parsed)) {
+    chrome.tabs.sendMessage(parsed.tabId, {
+      type: "float:qualityHint",
+      videoId: parsed.videoId,
+      profile: parsed.profile,
+      pipWidth: parsed.pipWidth,
+      pipHeight: parsed.pipHeight,
+    });
+    return;
+  }
+
   if (FloatProtocolIsAnswerMessage(parsed)) {
     chrome.tabs.sendMessage(parsed.tabId, {
       type: "float:signal:answer",

@@ -13,6 +13,7 @@ if (!globalScope.FloatProtocol) {
       stop: "stop",
       playback: "playback",
       seek: "seek",
+      qualityHint: "qualityHint",
       autoStartBackground: "autoStartBackground",
       autoStopForeground: "autoStopForeground",
       error: "error",
@@ -108,6 +109,41 @@ function isSeekMessage(
   );
 }
 
+function isQualityHintMessage(
+  message: unknown,
+): message is {
+  type: "qualityHint";
+  tabId: number;
+  videoId: string;
+  profile: "high" | "balanced" | "performance";
+  pipWidth?: number;
+  pipHeight?: number;
+} {
+  if (!isUnknownRecord(message)) {
+    return false;
+  }
+
+  const profile = message.profile;
+  const isKnownProfile = profile === "high" || profile === "balanced" || profile === "performance";
+  const pipWidth = message.pipWidth;
+  const pipHeight = message.pipHeight;
+  const hasNoPiPSize = typeof pipWidth === "undefined" && typeof pipHeight === "undefined";
+  const hasPiPSize =
+    typeof pipWidth === "number" &&
+    Number.isFinite(pipWidth) &&
+    pipWidth > 0 &&
+    typeof pipHeight === "number" &&
+    Number.isFinite(pipHeight) &&
+    pipHeight > 0;
+  return (
+    message.type === FloatProtocol.messageType.qualityHint &&
+    typeof message.tabId === "number" &&
+    typeof message.videoId === "string" &&
+    isKnownProfile &&
+    (hasNoPiPSize || hasPiPSize)
+  );
+}
+
 function isAnswerMessage(
   message: unknown,
 ): message is { type: "answer"; tabId: number; videoId: string; sdp: string } {
@@ -164,6 +200,7 @@ globalScope.FloatProtocolIsAutoStartBackgroundMessage = isAutoStartBackgroundMes
 globalScope.FloatProtocolIsAutoStopForegroundMessage = isAutoStopForegroundMessage;
 globalScope.FloatProtocolIsPlaybackMessage = isPlaybackMessage;
 globalScope.FloatProtocolIsSeekMessage = isSeekMessage;
+globalScope.FloatProtocolIsQualityHintMessage = isQualityHintMessage;
 globalScope.FloatProtocolIsAnswerMessage = isAnswerMessage;
 globalScope.FloatProtocolIsIceMessage = isIceMessage;
 globalScope.FloatProtocolError = asErrorMessage;

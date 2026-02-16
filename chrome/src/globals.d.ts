@@ -12,6 +12,7 @@ type FloatProtocolShape = {
     stop: "stop";
     playback: "playback";
     seek: "seek";
+    qualityHint: "qualityHint";
     autoStartBackground: "autoStartBackground";
     autoStopForeground: "autoStopForeground";
     error: "error";
@@ -37,6 +38,16 @@ declare var FloatProtocolIsPlaybackMessage: (
 declare var FloatProtocolIsSeekMessage: (
   message: unknown,
 ) => message is { type: "seek"; tabId: number; videoId: string; intervalSeconds: number };
+declare var FloatProtocolIsQualityHintMessage: (
+  message: unknown,
+) => message is {
+  type: "qualityHint";
+  tabId: number;
+  videoId: string;
+  profile: "high" | "balanced" | "performance";
+  pipWidth?: number;
+  pipHeight?: number;
+};
 declare var FloatProtocolIsAnswerMessage: (
   message: unknown,
 ) => message is { type: "answer"; tabId: number; videoId: string; sdp: string };

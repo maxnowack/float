@@ -13,16 +13,22 @@ protocol WebRTCReceiver {
     var onStreamingChanged: ((Bool) -> Void)? { get set }
     var onPlaybackCommand: ((Bool) -> Void)? { get set }
     var onSeekCommand: ((Double) -> Void)? { get set }
+    var onPiPRenderSizeChanged: ((CGSize) -> Void)? { get set }
     func handleOffer(_ offer: OfferMessage) async throws -> String
     func addRemoteIceCandidate(_ ice: IceMessage) async throws
     func stop()
     func updatePlaybackState(isPlaying: Bool)
     func updatePlaybackProgress(elapsedSeconds: Double?, durationSeconds: Double?)
     func setDebugLoggingEnabled(_ enabled: Bool)
+    func setDiagnosticsOverlayEnabled(_ enabled: Bool)
 }
 
 extension WebRTCReceiver {
     func setDebugLoggingEnabled(_ enabled: Bool) {
+        _ = enabled
+    }
+
+    func setDiagnosticsOverlayEnabled(_ enabled: Bool) {
         _ = enabled
     }
 }

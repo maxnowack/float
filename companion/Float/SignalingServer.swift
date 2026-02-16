@@ -4,6 +4,7 @@ import Network
 
 private let signalingDebugLoggingDefaultsKey = "Float.signalingDebugLoggingEnabled"
 private let receiverDebugLoggingDefaultsKey = "Float.receiverDebugLoggingEnabled"
+private let diagnosticsOverlayDefaultsKey = "Float.diagnosticsOverlayEnabled"
 
 private func loadSignalingDebugLoggingEnabled() -> Bool {
     UserDefaults.standard.object(forKey: signalingDebugLoggingDefaultsKey) as? Bool ?? false
@@ -11,6 +12,10 @@ private func loadSignalingDebugLoggingEnabled() -> Bool {
 
 private func loadReceiverDebugLoggingEnabled() -> Bool {
     UserDefaults.standard.object(forKey: receiverDebugLoggingDefaultsKey) as? Bool ?? false
+}
+
+private func loadDiagnosticsOverlayEnabled() -> Bool {
+    UserDefaults.standard.object(forKey: diagnosticsOverlayDefaultsKey) as? Bool ?? true
 }
 
 @MainActor
@@ -48,6 +53,19 @@ final class SignalingServer: ObservableObject {
         }
     }
 
+    private enum VideoQualityProfileHint: String {
+        case high
+        case balanced
+        case performance
+    }
+
+    private struct LastVideoQualityHint {
+        let targetID: String
+        let profile: VideoQualityProfileHint
+        let pipWidth: Int
+        let pipHeight: Int
+    }
+
     static let port: UInt16 = 17891
     private static let autoStartBackgroundDefaultsKey = "Float.autoStartBackgroundEnabled"
     private static let autoStopForegroundDefaultsKey = "Float.autoStopForegroundEnabled"
@@ -62,6 +80,7 @@ final class SignalingServer: ObservableObject {
     @Published private(set) var autoStopForegroundEnabled = true
     @Published private(set) var signalingDebugLoggingEnabled = false
     @Published private(set) var receiverDebugLoggingEnabled = false
+    @Published private(set) var diagnosticsOverlayEnabled = true
 
     struct VideoSource: Identifiable {
         let tabId: Int
@@ -101,15 +120,19 @@ final class SignalingServer: ObservableObject {
     private var activeTabId: Int?
     private var activeVideoId: String?
     private var stopRequestInFlight = false
+    private var latestPiPRenderSize: CGSize?
+    private var lastVideoQualityHint: LastVideoQualityHint?
 
     init() {
         autoStartBackgroundEnabled = UserDefaults.standard.object(forKey: Self.autoStartBackgroundDefaultsKey) as? Bool ?? false
         autoStopForegroundEnabled = UserDefaults.standard.object(forKey: Self.autoStopForegroundDefaultsKey) as? Bool ?? true
         signalingDebugLoggingEnabled = loadSignalingDebugLoggingEnabled()
         receiverDebugLoggingEnabled = loadReceiverDebugLoggingEnabled()
+        diagnosticsOverlayEnabled = loadDiagnosticsOverlayEnabled()
         var receiver = makeWebRTCReceiver()
         self.webRTCReceiver = receiver
         receiver.setDebugLoggingEnabled(receiverDebugLoggingEnabled)
+        receiver.setDiagnosticsOverlayEnabled(diagnosticsOverlayEnabled)
         receiver.onLocalIceCandidate = { [weak self] candidate in
             Task { @MainActor [weak self] in
                 guard let self else { return }
@@ -137,6 +160,11 @@ final class SignalingServer: ObservableObject {
         receiver.onSeekCommand = { [weak self] intervalSeconds in
             Task { @MainActor [weak self] in
                 self?.requestSeekChange(intervalSeconds: intervalSeconds)
+            }
+        }
+        receiver.onPiPRenderSizeChanged = { [weak self] size in
+            Task { @MainActor [weak self] in
+                self?.handlePiPRenderSizeChanged(size)
             }
         }
         start()
@@ -198,6 +226,7 @@ final class SignalingServer: ObservableObject {
         stopRequestInFlight = false
         activeTabId = tabId
         activeVideoId = videoId
+        lastVideoQualityHint = nil
         webRTCReceiver.updatePlaybackState(isPlaying: true)
         let payload: [String: Any] = [
             "type": FloatProtocol.MessageType.start,
@@ -206,6 +235,7 @@ final class SignalingServer: ObservableObject {
         ]
 
         sendToAnyClient(payload)
+        sendVideoQualityHintIfNeeded(force: true)
     }
 
     func requestStop() {
@@ -219,6 +249,7 @@ final class SignalingServer: ObservableObject {
         isStreaming = false
         activeTabId = nil
         activeVideoId = nil
+        lastVideoQualityHint = nil
         webRTCReceiver.stop()
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])
     }
@@ -260,6 +291,16 @@ final class SignalingServer: ObservableObject {
         receiverDebugLoggingEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: receiverDebugLoggingDefaultsKey)
         webRTCReceiver.setDebugLoggingEnabled(enabled)
+    }
+
+    func setDiagnosticsOverlayEnabled(_ enabled: Bool) {
+        guard diagnosticsOverlayEnabled != enabled else {
+            return
+        }
+
+        diagnosticsOverlayEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: diagnosticsOverlayDefaultsKey)
+        webRTCReceiver.setDiagnosticsOverlayEnabled(enabled)
     }
 
     func isActiveSource(_ source: VideoSource) -> Bool {
@@ -387,6 +428,7 @@ final class SignalingServer: ObservableObject {
                     self.isStreaming = false
                     self.activeTabId = nil
                     self.activeVideoId = nil
+                    self.lastVideoQualityHint = nil
                     self.tabs = []
                 }
             case FloatProtocol.MessageType.offer:
@@ -446,8 +488,73 @@ final class SignalingServer: ObservableObject {
 
         activeTabId = nil
         activeVideoId = nil
+        lastVideoQualityHint = nil
         stopRequestInFlight = true
         sendToAnyClient(["type": FloatProtocol.MessageType.stop])
+    }
+
+    private func handlePiPRenderSizeChanged(_ size: CGSize) {
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else {
+            return
+        }
+        latestPiPRenderSize = size
+        sendVideoQualityHintIfNeeded(force: false)
+    }
+
+    private func targetID(tabId: Int, videoId: String) -> String {
+        "\(tabId):\(videoId)"
+    }
+
+    private func videoQualityProfileHint(forPiPRenderSize size: CGSize) -> VideoQualityProfileHint {
+        let width = max(1, size.width)
+        let height = max(1, size.height)
+        let longEdge = max(width, height)
+        let area = width * height
+
+        if longEdge >= 1900 || area >= 1_700_000 {
+            return .high
+        }
+        if longEdge >= 1450 || area >= 1_000_000 {
+            return .balanced
+        }
+        return .performance
+    }
+
+    private func sendVideoQualityHintIfNeeded(force: Bool) {
+        guard let activeTabId, let activeVideoId, let size = latestPiPRenderSize else {
+            return
+        }
+
+        let profile = videoQualityProfileHint(forPiPRenderSize: size)
+        let pipWidth = Int(size.width.rounded())
+        let pipHeight = Int(size.height.rounded())
+        let target = targetID(tabId: activeTabId, videoId: activeVideoId)
+        if !force,
+           let lastVideoQualityHint,
+           lastVideoQualityHint.targetID == target,
+           lastVideoQualityHint.profile == profile,
+           lastVideoQualityHint.pipWidth == pipWidth,
+           lastVideoQualityHint.pipHeight == pipHeight
+        {
+            return
+        }
+
+        lastVideoQualityHint = LastVideoQualityHint(
+            targetID: target,
+            profile: profile,
+            pipWidth: pipWidth,
+            pipHeight: pipHeight
+        )
+
+        let payload = QualityHintMessage(
+            type: FloatProtocol.MessageType.qualityHint,
+            tabId: activeTabId,
+            videoId: activeVideoId,
+            profile: profile.rawValue,
+            pipWidth: pipWidth,
+            pipHeight: pipHeight
+        )
+        sendToAnyClientEncodable(payload)
     }
 
     private func sendToAnyClient(_ payload: [String: Any]) {
@@ -539,6 +646,7 @@ final class SignalingServer: ObservableObject {
             stopRequestInFlight = false
             activeTabId = offer.tabId
             activeVideoId = offer.videoId
+            lastVideoQualityHint = nil
             let answerSDP = try await webRTCReceiver.handleOffer(offer)
             let answer = AnswerMessage(
                 type: FloatProtocol.MessageType.answer,
@@ -547,6 +655,7 @@ final class SignalingServer: ObservableObject {
                 sdp: answerSDP
             )
             sendEncodable(answer, to: clientID)
+            sendVideoQualityHintIfNeeded(force: true)
         } catch {
             sendError("Failed to process offer for \(offer.videoId): \(error.localizedDescription)", to: clientID)
         }

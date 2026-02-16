@@ -13,10 +13,14 @@ final class NativePiPController: NSObject {
     var onPictureInPictureClosed: (() -> Void)?
     var onPlaybackCommand: ((Bool) -> Void)?
     var onSeekCommand: ((Double) -> Void)?
+    var onPiPRenderSizeChanged: ((CGSize) -> Void)?
 
     private let hostView = NSView(
         frame: CGRect(origin: .zero, size: Constants.defaultHostSize)
     )
+    private let contentContainerView = NSView()
+    private let diagnosticsOverlayView = NSView()
+    private let diagnosticsOverlayLabel = NSTextField(labelWithString: "")
     private weak var hostedContentView: NSView?
 
     private var privatePiPController: NSObject?
@@ -31,6 +35,7 @@ final class NativePiPController: NSObject {
 
     private var privatePiPPanel: NSWindow?
     private var privatePiPPanelCloseObserver: NSObjectProtocol?
+    private var privatePiPPanelResizeObserver: NSObjectProtocol?
     private var privatePiPVisibilityWatchdog: Timer?
     private var isObservingPrivatePiPPanel = false
     private var isObservingPrivatePiPPlaying = false
@@ -44,6 +49,7 @@ final class NativePiPController: NSObject {
     private var playbackAnchorDate: Date?
     private var playbackIsPlaying = true
     private var playbackDurationSeconds: Double = 0
+    private var lastReportedPiPRenderSize = CGSize.zero
 
     override init() {
         super.init()
@@ -55,6 +61,14 @@ final class NativePiPController: NSObject {
             controller.removeObserver(self, forKeyPath: "playing", context: &privatePiPPlayingKVOContext)
             isObservingPrivatePiPPlaying = false
         }
+        if let observer = privatePiPPanelCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            privatePiPPanelCloseObserver = nil
+        }
+        if let resizeObserver = privatePiPPanelResizeObserver {
+            NotificationCenter.default.removeObserver(resizeObserver)
+            privatePiPPanelResizeObserver = nil
+        }
     }
 
     func setContentView(_ view: NSView) {
@@ -65,12 +79,12 @@ final class NativePiPController: NSObject {
         hostedContentView?.removeFromSuperview()
         hostedContentView = view
         view.translatesAutoresizingMaskIntoConstraints = false
-        hostView.addSubview(view)
+        contentContainerView.addSubview(view)
         NSLayoutConstraint.activate([
-            view.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
-            view.trailingAnchor.constraint(equalTo: hostView.trailingAnchor),
-            view.topAnchor.constraint(equalTo: hostView.topAnchor),
-            view.bottomAnchor.constraint(equalTo: hostView.bottomAnchor),
+            view.leadingAnchor.constraint(equalTo: contentContainerView.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: contentContainerView.trailingAnchor),
+            view.topAnchor.constraint(equalTo: contentContainerView.topAnchor),
+            view.bottomAnchor.constraint(equalTo: contentContainerView.bottomAnchor),
         ])
     }
 
@@ -135,6 +149,13 @@ final class NativePiPController: NSObject {
         pushPlaybackStateToPiPController()
     }
 
+    func updateDiagnosticsOverlay(_ text: String?) {
+        let nextText = text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let shouldShow = !nextText.isEmpty
+        diagnosticsOverlayLabel.stringValue = nextText
+        diagnosticsOverlayView.isHidden = !shouldShow
+    }
+
     private func setupIfNeeded() {
         guard privatePiPController == nil else { return }
 
@@ -150,6 +171,44 @@ final class NativePiPController: NSObject {
         if hostView.layer?.backgroundColor == nil {
             hostView.layer?.backgroundColor = NSColor.black.cgColor
         }
+
+        contentContainerView.translatesAutoresizingMaskIntoConstraints = false
+        contentContainerView.wantsLayer = true
+        hostView.addSubview(contentContainerView)
+        NSLayoutConstraint.activate([
+            contentContainerView.leadingAnchor.constraint(equalTo: hostView.leadingAnchor),
+            contentContainerView.trailingAnchor.constraint(equalTo: hostView.trailingAnchor),
+            contentContainerView.topAnchor.constraint(equalTo: hostView.topAnchor),
+            contentContainerView.bottomAnchor.constraint(equalTo: hostView.bottomAnchor),
+        ])
+
+        diagnosticsOverlayView.translatesAutoresizingMaskIntoConstraints = false
+        diagnosticsOverlayView.wantsLayer = true
+        diagnosticsOverlayView.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.62).cgColor
+        diagnosticsOverlayView.layer?.cornerRadius = 6
+        diagnosticsOverlayView.layer?.masksToBounds = true
+        diagnosticsOverlayView.isHidden = true
+
+        diagnosticsOverlayLabel.translatesAutoresizingMaskIntoConstraints = false
+        diagnosticsOverlayLabel.textColor = NSColor.white
+        diagnosticsOverlayLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .semibold)
+        diagnosticsOverlayLabel.lineBreakMode = .byTruncatingTail
+        diagnosticsOverlayLabel.stringValue = ""
+
+        diagnosticsOverlayView.addSubview(diagnosticsOverlayLabel)
+        NSLayoutConstraint.activate([
+            diagnosticsOverlayLabel.leadingAnchor.constraint(equalTo: diagnosticsOverlayView.leadingAnchor, constant: 8),
+            diagnosticsOverlayLabel.trailingAnchor.constraint(equalTo: diagnosticsOverlayView.trailingAnchor, constant: -8),
+            diagnosticsOverlayLabel.topAnchor.constraint(equalTo: diagnosticsOverlayView.topAnchor, constant: 4),
+            diagnosticsOverlayLabel.bottomAnchor.constraint(equalTo: diagnosticsOverlayView.bottomAnchor, constant: -4),
+        ])
+
+        hostView.addSubview(diagnosticsOverlayView)
+        NSLayoutConstraint.activate([
+            diagnosticsOverlayView.leadingAnchor.constraint(equalTo: hostView.leadingAnchor, constant: 12),
+            diagnosticsOverlayView.topAnchor.constraint(equalTo: hostView.topAnchor, constant: 12),
+            diagnosticsOverlayView.widthAnchor.constraint(lessThanOrEqualTo: hostView.widthAnchor, multiplier: 0.82),
+        ])
 
         privatePiPContentViewController = NSViewController()
         privatePiPContentViewController.view = hostView
@@ -542,8 +601,9 @@ final class NativePiPController: NSObject {
             isObservingPrivatePiPPanel = false
         }
 
-        removePrivatePiPPanelCloseObserver()
+        removePrivatePiPPanelObservers()
         privatePiPPanel = nil
+        lastReportedPiPRenderSize = .zero
     }
 
     private func refreshPrivatePiPPanelFromController() {
@@ -581,6 +641,8 @@ final class NativePiPController: NSObject {
             handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
             return
         }
+
+        maybeNotifyPiPRenderSizeChanged(for: panel)
     }
 
     private func currentPrivatePiPPanel() -> NSWindow? {
@@ -591,7 +653,7 @@ final class NativePiPController: NSObject {
     private func updateObservedPrivatePiPPanel(_ panel: NSWindow?) {
         guard privatePiPPanel !== panel else { return }
 
-        removePrivatePiPPanelCloseObserver()
+        removePrivatePiPPanelObservers()
 
         privatePiPPanel = panel
         guard let panel else { return }
@@ -605,12 +667,51 @@ final class NativePiPController: NSObject {
                 self?.handlePrivatePiPPanelWillClose()
             }
         }
+
+        privatePiPPanelResizeObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.didResizeNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.handlePrivatePiPPanelDidResize()
+            }
+        }
+
+        maybeNotifyPiPRenderSizeChanged(for: panel)
     }
 
     private func handlePrivatePiPPanelWillClose() {
         guard privatePiPPresented else { return }
 
         handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
+    }
+
+    private func handlePrivatePiPPanelDidResize() {
+        guard privatePiPPresented else { return }
+        guard let panel = privatePiPPanel else { return }
+        maybeNotifyPiPRenderSizeChanged(for: panel)
+    }
+
+    private func effectivePiPContentSizePixels(for panel: NSWindow) -> CGSize {
+        let pointsSize = panel.contentView?.bounds.size ?? panel.contentLayoutRect.size
+        let scale = panel.backingScaleFactor > 0 ? panel.backingScaleFactor : 1
+        return CGSize(
+            width: max(1, pointsSize.width * scale),
+            height: max(1, pointsSize.height * scale)
+        )
+    }
+
+    private func maybeNotifyPiPRenderSizeChanged(for panel: NSWindow) {
+        let size = effectivePiPContentSizePixels(for: panel)
+        guard size.width.isFinite, size.height.isFinite, size.width > 0, size.height > 0 else { return }
+
+        let widthDelta = abs(size.width - lastReportedPiPRenderSize.width)
+        let heightDelta = abs(size.height - lastReportedPiPRenderSize.height)
+        guard widthDelta >= 8 || heightDelta >= 8 || lastReportedPiPRenderSize == .zero else { return }
+
+        lastReportedPiPRenderSize = size
+        onPiPRenderSizeChanged?(size)
     }
 
     override func observeValue(
@@ -720,9 +821,14 @@ final class NativePiPController: NSObject {
         !isStoppingPrivatePiPProgrammatically
     }
 
-    private func removePrivatePiPPanelCloseObserver() {
-        guard let observer = privatePiPPanelCloseObserver else { return }
-        NotificationCenter.default.removeObserver(observer)
-        privatePiPPanelCloseObserver = nil
+    private func removePrivatePiPPanelObservers() {
+        if let observer = privatePiPPanelCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            privatePiPPanelCloseObserver = nil
+        }
+        if let resizeObserver = privatePiPPanelResizeObserver {
+            NotificationCenter.default.removeObserver(resizeObserver)
+            privatePiPPanelResizeObserver = nil
+        }
     }
 }
