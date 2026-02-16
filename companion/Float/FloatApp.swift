@@ -142,24 +142,6 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         autoStopItem.state = signalingServer.autoStopForegroundEnabled ? .on : .off
         menu.addItem(autoStopItem)
 
-        let signalingLogsItem = NSMenuItem(
-            title: "Signaling Logs",
-            action: #selector(handleSignalingLogsToggled(_:)),
-            keyEquivalent: ""
-        )
-        signalingLogsItem.target = self
-        signalingLogsItem.state = signalingServer.signalingDebugLoggingEnabled ? .on : .off
-        menu.addItem(signalingLogsItem)
-
-        let receiverLogsItem = NSMenuItem(
-            title: "Receiver Logs",
-            action: #selector(handleReceiverLogsToggled(_:)),
-            keyEquivalent: ""
-        )
-        receiverLogsItem.target = self
-        receiverLogsItem.state = signalingServer.receiverDebugLoggingEnabled ? .on : .off
-        menu.addItem(receiverLogsItem)
-
         let fpsOverlayItem = NSMenuItem(
             title: "FPS Overlay",
             action: #selector(handleFPSOverlayToggled(_:)),
@@ -205,18 +187,6 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     @objc private func handleAutoStopForegroundToggled(_ sender: NSMenuItem) {
         let enabled = sender.state != .on
         signalingServer.setAutoStopForegroundEnabled(enabled)
-        sender.state = enabled ? .on : .off
-    }
-
-    @objc private func handleSignalingLogsToggled(_ sender: NSMenuItem) {
-        let enabled = sender.state != .on
-        signalingServer.setSignalingDebugLoggingEnabled(enabled)
-        sender.state = enabled ? .on : .off
-    }
-
-    @objc private func handleReceiverLogsToggled(_ sender: NSMenuItem) {
-        let enabled = sender.state != .on
-        signalingServer.setReceiverDebugLoggingEnabled(enabled)
         sender.state = enabled ? .on : .off
     }
 
