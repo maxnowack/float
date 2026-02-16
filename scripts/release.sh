@@ -214,16 +214,16 @@ fi
 git commit -m "chore(release): bump version to $VERSION ($BUILD_NUMBER)"
 
 # Avoid stale uploads from prior runs.
-rm -f "$ROOT_DIR"/artifacts/chrome/*.zip "$ROOT_DIR"/artifacts/companion/*.zip 2>/dev/null || true
+rm -f "$ROOT_DIR"/artifacts/*.zip 2>/dev/null || true
 
 "$ROOT_DIR/scripts/pack-all.sh" "$COMPANION_CONFIGURATION"
 
 mapfile -t ARTIFACTS < <(
-  find "$ROOT_DIR/artifacts/chrome" "$ROOT_DIR/artifacts/companion" -maxdepth 1 -type f -name '*.zip' 2>/dev/null | sort
+  find "$ROOT_DIR/artifacts" -maxdepth 1 -type f -name '*.zip' 2>/dev/null | sort
 )
 
 if [[ "${#ARTIFACTS[@]}" -eq 0 ]]; then
-  die "no packaged artifacts found under artifacts/chrome or artifacts/companion"
+  die "no packaged artifacts found under artifacts/"
 fi
 
 echo "Artifacts:"

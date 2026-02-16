@@ -5,6 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PROJECT_PATH="$ROOT_DIR/companion/Float.xcodeproj"
 SCHEME="Float"
 CONFIGURATION="${1:-Release}"
+ARCHITECTURE="${2:-}"
 
 case "$CONFIGURATION" in
   Debug|Release)
@@ -20,20 +21,28 @@ if [[ ! -d "$PROJECT_PATH" ]]; then
   exit 1
 fi
 
-xcodebuild \
-  -project "$PROJECT_PATH" \
-  -scheme "$SCHEME" \
-  -configuration "$CONFIGURATION" \
-  -sdk macosx \
-  build
+XCODEBUILD_ARGS=(
+  -project "$PROJECT_PATH"
+  -scheme "$SCHEME"
+  -configuration "$CONFIGURATION"
+  -sdk macosx
+)
+
+if [[ -n "$ARCHITECTURE" ]]; then
+  case "$ARCHITECTURE" in
+    arm64|x86_64) ;;
+    *)
+      echo "error: architecture must be arm64 or x86_64 (got: $ARCHITECTURE)." >&2
+      exit 1
+      ;;
+  esac
+  XCODEBUILD_ARGS+=(-arch "$ARCHITECTURE")
+fi
+
+xcodebuild "${XCODEBUILD_ARGS[@]}" build
 
 BUILD_SETTINGS="$(
-  xcodebuild \
-    -project "$PROJECT_PATH" \
-    -scheme "$SCHEME" \
-    -configuration "$CONFIGURATION" \
-    -sdk macosx \
-    -showBuildSettings
+  xcodebuild "${XCODEBUILD_ARGS[@]}" -showBuildSettings
 )"
 
 TARGET_BUILD_DIR="$(
@@ -69,4 +78,8 @@ if [[ ! -d "$APP_PATH" ]]; then
   exit 1
 fi
 
-echo "Built companion app: $APP_PATH"
+if [[ -n "$ARCHITECTURE" ]]; then
+  echo "Built companion app ($ARCHITECTURE): $APP_PATH"
+else
+  echo "Built companion app: $APP_PATH"
+fi
