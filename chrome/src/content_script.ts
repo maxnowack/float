@@ -12,6 +12,32 @@ type VideoMeta = {
   createdAt: number;
 };
 
+type VideoQualityProfileId = "high" | "balanced" | "performance";
+
+type VideoQualityProfile = {
+  maxWidth: number;
+  maxHeight: number;
+  maxFramerate: number;
+  maxBitrateBps: number;
+  degradationPreference: "maintain-resolution" | "maintain-framerate";
+};
+
+type VideoAdaptationCounters = {
+  framesEncoded: number;
+  totalEncodeTime: number;
+  framesSent: number;
+  framesDropped: number;
+};
+
+type VideoAdaptationState = {
+  sender: RTCRtpSender;
+  selectedVideoId: string;
+  profileId: VideoQualityProfileId;
+  lastCounters: VideoAdaptationCounters | null;
+  lowPressureSamples: number;
+  updateInFlight: boolean;
+};
+
 const videoMeta = new WeakMap<HTMLVideoElement, VideoMeta>();
 let videoCounter = 0;
 let scheduled = false;
@@ -19,14 +45,23 @@ let activePeer: RTCPeerConnection | null = null;
 let activeStream: MediaStream | null = null;
 let activeVideoId: string | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
-let sourceProbeTimerId: number | null = null;
 let senderStatsTimerId: number | null = null;
+let activeVideoAdaptationState: VideoAdaptationState | null = null;
 let didNotifyBackgroundSinceForeground = false;
 const FLOAT_MAX_VIDEO_FPS = 60;
-const FLOAT_VIDEO_MAX_BITRATE_BPS = 25_000_000;
 const FLOAT_AUDIO_MAX_BITRATE_BPS = 320_000;
-const FLOAT_MAX_VIDEO_WIDTH = 1280;
-const FLOAT_MAX_VIDEO_HEIGHT = 720;
+const FLOAT_VIDEO_ADAPTIVE_STATS_INTERVAL_MS = 2000;
+const FLOAT_VIDEO_DROP_RATIO_HIGH = 0.08;
+const FLOAT_VIDEO_DROP_RATIO_MEDIUM = 0.03;
+const FLOAT_VIDEO_ENCODE_MS_PER_FRAME_HIGH = 16;
+const FLOAT_VIDEO_ENCODE_MS_PER_FRAME_MEDIUM = 12;
+const FLOAT_ENABLE_EXPENSIVE_DEBUG_PROBES = (() => {
+  try {
+    return window.localStorage.getItem("float:debug:probes") === "1";
+  } catch {
+    return false;
+  }
+})();
 const FLOAT_VIDEO_CODEC_PRIORITY = ["video/H264", "video/VP8", "video/VP9", "video/AV1"] as const;
 const FLOAT_AUDIO_CODEC_PRIORITY = ["audio/opus", "audio/ISAC", "audio/G722", "audio/PCMU", "audio/PCMA"] as const;
 const isTopFrame = (() => {
@@ -51,6 +86,64 @@ function debugLog(event: string, payload?: Record<string, unknown>): void {
     payload: payload ?? null,
     url: location.href,
   });
+}
+
+function getVideoQualityProfile(profileId: VideoQualityProfileId): VideoQualityProfile {
+  switch (profileId) {
+    case "high":
+      return {
+        maxWidth: 1920,
+        maxHeight: 1080,
+        maxFramerate: 60,
+        maxBitrateBps: 45_000_000,
+        degradationPreference: "maintain-resolution",
+      };
+    case "balanced":
+      return {
+        maxWidth: 1600,
+        maxHeight: 900,
+        maxFramerate: 60,
+        maxBitrateBps: 28_000_000,
+        degradationPreference: "maintain-framerate",
+      };
+    case "performance":
+      return {
+        maxWidth: 1280,
+        maxHeight: 720,
+        maxFramerate: 45,
+        maxBitrateBps: 16_000_000,
+        degradationPreference: "maintain-framerate",
+      };
+  }
+}
+
+function nextLowerVideoQualityProfile(profileId: VideoQualityProfileId): VideoQualityProfileId {
+  switch (profileId) {
+    case "high":
+      return "balanced";
+    case "balanced":
+      return "performance";
+    case "performance":
+      return "performance";
+  }
+}
+
+function nextHigherVideoQualityProfile(profileId: VideoQualityProfileId): VideoQualityProfileId {
+  switch (profileId) {
+    case "high":
+      return "high";
+    case "balanced":
+      return "high";
+    case "performance":
+      return "balanced";
+  }
+}
+
+function readFiniteNumber(value: unknown): number | null {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return value;
+  }
+  return null;
 }
 
 function generateVideoId(element: HTMLVideoElement): string {
@@ -296,87 +389,6 @@ function notifyWebRTCError(reason: string): void {
   });
 }
 
-function stopSourceProbe(): void {
-  if (sourceProbeTimerId !== null) {
-    window.clearInterval(sourceProbeTimerId);
-    sourceProbeTimerId = null;
-  }
-}
-
-function sampleVideoLuma(video: HTMLVideoElement): { tl: number; center: number; br: number } | null {
-  if (video.videoWidth <= 0 || video.videoHeight <= 0) {
-    return null;
-  }
-  const canvas = document.createElement("canvas");
-  canvas.width = 64;
-  canvas.height = 36;
-  const ctx = canvas.getContext("2d", { willReadFrequently: true });
-  if (!ctx) {
-    return null;
-  }
-
-  try {
-    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
-    const sampleAt = (x: number, y: number): number => {
-      const clampedX = Math.max(0, Math.min(canvas.width - 1, x));
-      const clampedY = Math.max(0, Math.min(canvas.height - 1, y));
-      const idx = (clampedY * canvas.width + clampedX) * 4;
-      const r = data[idx] ?? 0;
-      const g = data[idx + 1] ?? 0;
-      const b = data[idx + 2] ?? 0;
-      return Math.round((r * 77 + g * 150 + b * 29) / 256);
-    };
-
-    return {
-      tl: sampleAt(4, 4),
-      center: sampleAt(Math.floor(canvas.width / 2), Math.floor(canvas.height / 2)),
-      br: sampleAt(canvas.width - 5, canvas.height - 5),
-    };
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : String(error);
-    debugLog("source.probe.failed", { reason });
-    return null;
-  }
-}
-
-function startSourceProbe(video: HTMLVideoElement, selectedVideoId: string): void {
-  stopSourceProbe();
-
-  const style = window.getComputedStyle(video);
-  const rect = video.getBoundingClientRect();
-  debugLog("source.element", {
-    selectedVideoId,
-    clientWidth: video.clientWidth,
-    clientHeight: video.clientHeight,
-    videoWidth: video.videoWidth,
-    videoHeight: video.videoHeight,
-    objectFit: style.objectFit,
-    objectPosition: style.objectPosition,
-    transform: style.transform,
-    rectWidth: Math.round(rect.width),
-    rectHeight: Math.round(rect.height),
-    rectLeft: Math.round(rect.left),
-    rectTop: Math.round(rect.top),
-  });
-
-  sourceProbeTimerId = window.setInterval(() => {
-    const probe = sampleVideoLuma(video);
-    if (!probe) {
-      return;
-    }
-    debugLog("source.probe", {
-      selectedVideoId,
-      tl: probe.tl,
-      center: probe.center,
-      br: probe.br,
-      paused: video.paused,
-      readyState: video.readyState,
-      currentTime: Number(video.currentTime.toFixed(2)),
-    });
-  }, 2000);
-}
-
 function codecPriorityIndex(mimeType: string, preferredCodecs: readonly string[]): number {
   const normalizedMimeType = mimeType.toLowerCase();
   const index = preferredCodecs.findIndex((codec) => codec.toLowerCase() === normalizedMimeType);
@@ -386,6 +398,8 @@ function codecPriorityIndex(mimeType: string, preferredCodecs: readonly string[]
 function computeScaleResolutionDownBy(
   width: number | undefined,
   height: number | undefined,
+  maxWidth: number,
+  maxHeight: number,
 ): number {
   const safeWidth = typeof width === "number" && Number.isFinite(width) && width > 0 ? width : 0;
   const safeHeight = typeof height === "number" && Number.isFinite(height) && height > 0 ? height : 0;
@@ -393,8 +407,8 @@ function computeScaleResolutionDownBy(
     return 1;
   }
 
-  const widthScale = safeWidth / FLOAT_MAX_VIDEO_WIDTH;
-  const heightScale = safeHeight / FLOAT_MAX_VIDEO_HEIGHT;
+  const widthScale = safeWidth / maxWidth;
+  const heightScale = safeHeight / maxHeight;
   const requiredScale = Math.max(1, widthScale, heightScale);
   if (!Number.isFinite(requiredScale) || requiredScale <= 1) {
     return 1;
@@ -536,10 +550,217 @@ function logAudioTrackDiagnostics(selectedVideoId: string, audioTracks: MediaStr
   });
 }
 
-function startSenderStatsProbe(peer: RTCPeerConnection, selectedVideoId: string): void {
+function extractOutboundVideoStats(stats: RTCStatsReport): (RTCStats & Record<string, unknown>) | null {
+  let outboundVideo: (RTCStats & Record<string, unknown>) | null = null;
+  stats.forEach((item) => {
+    const candidate = item as RTCStats & Record<string, unknown>;
+    if (candidate.type !== "outbound-rtp") {
+      return;
+    }
+    if (candidate.isRemote === true) {
+      return;
+    }
+    const kind = (candidate.kind ?? candidate.mediaType) as string | undefined;
+    if (kind !== "video") {
+      return;
+    }
+    outboundVideo = candidate;
+  });
+  return outboundVideo;
+}
+
+function maybeLogAudioSenderStats(stats: RTCStatsReport, selectedVideoId: string): void {
+  if (!FLOAT_ENABLE_EXPENSIVE_DEBUG_PROBES) {
+    return;
+  }
+
+  const codecById = new Map<string, RTCStats>();
+  const sourceById = new Map<string, RTCStats>();
+
+  stats.forEach((item) => {
+    if (item.type === "codec") {
+      codecById.set(item.id, item);
+      return;
+    }
+    if (item.type === "media-source" || item.type === "track") {
+      sourceById.set(item.id, item);
+    }
+  });
+
+  const reports: Record<string, unknown>[] = [];
+  stats.forEach((item) => {
+    const outbound = item as RTCStats & Record<string, unknown>;
+    if (outbound.type !== "outbound-rtp") {
+      return;
+    }
+    if (outbound.isRemote === true) {
+      return;
+    }
+    const kind = (outbound.kind ?? outbound.mediaType) as string | undefined;
+    if (kind !== "audio") {
+      return;
+    }
+
+    const codecId = typeof outbound.codecId === "string" ? outbound.codecId : null;
+    const codec = codecId ? (codecById.get(codecId) as Record<string, unknown> | undefined) : undefined;
+    const mediaSourceId =
+      typeof outbound.mediaSourceId === "string" ? (outbound.mediaSourceId as string) : null;
+    const mediaSource = mediaSourceId ? (sourceById.get(mediaSourceId) as Record<string, unknown> | undefined) : undefined;
+
+    reports.push({
+      id: outbound.id,
+      timestamp: outbound.timestamp,
+      bytesSent: outbound.bytesSent ?? null,
+      packetsSent: outbound.packetsSent ?? null,
+      headerBytesSent: outbound.headerBytesSent ?? null,
+      retransmittedPacketsSent: outbound.retransmittedPacketsSent ?? null,
+      codecMimeType: codec?.mimeType ?? null,
+      codecClockRate: codec?.clockRate ?? null,
+      codecChannels: codec?.channels ?? null,
+      codecSdpFmtpLine: codec?.sdpFmtpLine ?? null,
+      mediaSourceAudioLevel: mediaSource?.audioLevel ?? null,
+      mediaSourceTotalAudioEnergy: mediaSource?.totalAudioEnergy ?? null,
+      mediaSourceTotalSamplesDuration: mediaSource?.totalSamplesDuration ?? null,
+    });
+  });
+
+  if (reports.length > 0) {
+    debugLog("sender.stats.audio", {
+      selectedVideoId,
+      reports,
+    });
+  }
+}
+
+function updateAdaptiveVideoQualityFromStats(stats: RTCStatsReport, state: VideoAdaptationState): void {
+  const outbound = extractOutboundVideoStats(stats);
+  if (!outbound) {
+    return;
+  }
+
+  const framesEncoded = readFiniteNumber(outbound.framesEncoded);
+  const totalEncodeTime = readFiniteNumber(outbound.totalEncodeTime);
+  const framesSent = readFiniteNumber(outbound.framesSent);
+  const framesDropped = readFiniteNumber(outbound.framesDropped) ?? 0;
+
+  const counters =
+    framesEncoded !== null && totalEncodeTime !== null && framesSent !== null
+      ? {
+          framesEncoded,
+          totalEncodeTime,
+          framesSent,
+          framesDropped,
+        }
+      : null;
+
+  let encodeMsPerFrame: number | null = null;
+  let frameDropRatio: number | null = null;
+  if (counters && state.lastCounters) {
+    const deltaFramesEncoded = counters.framesEncoded - state.lastCounters.framesEncoded;
+    const deltaTotalEncodeTime = counters.totalEncodeTime - state.lastCounters.totalEncodeTime;
+    if (deltaFramesEncoded > 0 && deltaTotalEncodeTime >= 0) {
+      encodeMsPerFrame = (deltaTotalEncodeTime * 1000) / deltaFramesEncoded;
+    }
+
+    const deltaFramesSent = counters.framesSent - state.lastCounters.framesSent;
+    const deltaFramesDropped = counters.framesDropped - state.lastCounters.framesDropped;
+    const deltaTotalFrames = deltaFramesSent + deltaFramesDropped;
+    if (deltaFramesSent >= 0 && deltaFramesDropped >= 0 && deltaTotalFrames > 0) {
+      frameDropRatio = deltaFramesDropped / deltaTotalFrames;
+    }
+  }
+
+  if (counters) {
+    state.lastCounters = counters;
+  }
+
+  const qualityLimitationReason =
+    typeof outbound.qualityLimitationReason === "string" ? outbound.qualityLimitationReason : null;
+  const highPressure =
+    qualityLimitationReason === "cpu" ||
+    (encodeMsPerFrame !== null && encodeMsPerFrame >= FLOAT_VIDEO_ENCODE_MS_PER_FRAME_HIGH) ||
+    (frameDropRatio !== null && frameDropRatio >= FLOAT_VIDEO_DROP_RATIO_HIGH);
+  const mediumPressure =
+    qualityLimitationReason === "cpu" ||
+    (encodeMsPerFrame !== null && encodeMsPerFrame >= FLOAT_VIDEO_ENCODE_MS_PER_FRAME_MEDIUM) ||
+    (frameDropRatio !== null && frameDropRatio >= FLOAT_VIDEO_DROP_RATIO_MEDIUM);
+
+  let targetProfileId = state.profileId;
+  if (highPressure) {
+    state.lowPressureSamples = 0;
+    targetProfileId = nextLowerVideoQualityProfile(state.profileId);
+  } else if (mediumPressure && state.profileId === "high") {
+    state.lowPressureSamples = 0;
+    targetProfileId = "balanced";
+  } else if (!mediumPressure && !highPressure && state.profileId !== "high") {
+    state.lowPressureSamples += 1;
+    const recoveryThreshold = state.profileId === "performance" ? 3 : 6;
+    if (state.lowPressureSamples >= recoveryThreshold) {
+      targetProfileId = nextHigherVideoQualityProfile(state.profileId);
+      state.lowPressureSamples = 0;
+    }
+  }
+
+  if (targetProfileId === state.profileId || state.updateInFlight) {
+    return;
+  }
+
+  const previousProfileId = state.profileId;
+  state.updateInFlight = true;
+  void applySenderQualitySettings(state.sender, state.selectedVideoId, targetProfileId)
+    .then(() => {
+      if (activeVideoAdaptationState !== state) {
+        return;
+      }
+      state.profileId = targetProfileId;
+      debugLog("sender.parameters.video.profileChanged", {
+        selectedVideoId: state.selectedVideoId,
+        fromProfile: previousProfileId,
+        toProfile: targetProfileId,
+        qualityLimitationReason,
+        encodeMsPerFrame: encodeMsPerFrame !== null ? Number(encodeMsPerFrame.toFixed(2)) : null,
+        frameDropRatio: frameDropRatio !== null ? Number(frameDropRatio.toFixed(4)) : null,
+      });
+    })
+    .catch((error) => {
+      const reason = error instanceof Error ? error.message : "adaptive profile change failed";
+      debugLog("sender.parameters.video.profileChange.failed", {
+        selectedVideoId: state.selectedVideoId,
+        fromProfile: previousProfileId,
+        toProfile: targetProfileId,
+        reason,
+      });
+    })
+    .finally(() => {
+      if (activeVideoAdaptationState === state) {
+        state.updateInFlight = false;
+      }
+    });
+}
+
+function startSenderStatsProbe(
+  peer: RTCPeerConnection,
+  selectedVideoId: string,
+  videoSender: RTCRtpSender | null,
+): void {
   if (senderStatsTimerId !== null) {
     window.clearInterval(senderStatsTimerId);
     senderStatsTimerId = null;
+  }
+
+  activeVideoAdaptationState = videoSender
+    ? {
+        sender: videoSender,
+        selectedVideoId,
+        profileId: "high",
+        lastCounters: null,
+        lowPressureSamples: 0,
+        updateInFlight: false,
+      }
+    : null;
+
+  if (!activeVideoAdaptationState && !FLOAT_ENABLE_EXPENSIVE_DEBUG_PROBES) {
+    return;
   }
 
   let inFlight = false;
@@ -552,68 +773,15 @@ function startSenderStatsProbe(peer: RTCPeerConnection, selectedVideoId: string)
     void peer
       .getStats()
       .then((stats) => {
-        const codecById = new Map<string, RTCStats>();
-        const sourceById = new Map<string, RTCStats>();
-
-        stats.forEach((item) => {
-          if (item.type === "codec") {
-            codecById.set(item.id, item);
-            return;
-          }
-          if (item.type === "media-source" || item.type === "track") {
-            sourceById.set(item.id, item);
-          }
-        });
-
-        const reports: Record<string, unknown>[] = [];
-        stats.forEach((item) => {
-          const outbound = item as RTCStats & Record<string, unknown>;
-          if (outbound.type !== "outbound-rtp") {
-            return;
-          }
-          if (outbound.isRemote === true) {
-            return;
-          }
-          const kind = (outbound.kind ?? outbound.mediaType) as string | undefined;
-          if (kind !== "audio") {
-            return;
-          }
-
-          const codecId = typeof outbound.codecId === "string" ? outbound.codecId : null;
-          const codec = codecId ? (codecById.get(codecId) as Record<string, unknown> | undefined) : undefined;
-          const mediaSourceId =
-            typeof outbound.mediaSourceId === "string" ? (outbound.mediaSourceId as string) : null;
-          const mediaSource = mediaSourceId
-            ? (sourceById.get(mediaSourceId) as Record<string, unknown> | undefined)
-            : undefined;
-
-          reports.push({
-            id: outbound.id,
-            timestamp: outbound.timestamp,
-            bytesSent: outbound.bytesSent ?? null,
-            packetsSent: outbound.packetsSent ?? null,
-            headerBytesSent: outbound.headerBytesSent ?? null,
-            retransmittedPacketsSent: outbound.retransmittedPacketsSent ?? null,
-            codecMimeType: codec?.mimeType ?? null,
-            codecClockRate: codec?.clockRate ?? null,
-            codecChannels: codec?.channels ?? null,
-            codecSdpFmtpLine: codec?.sdpFmtpLine ?? null,
-            mediaSourceAudioLevel: mediaSource?.audioLevel ?? null,
-            mediaSourceTotalAudioEnergy: mediaSource?.totalAudioEnergy ?? null,
-            mediaSourceTotalSamplesDuration: mediaSource?.totalSamplesDuration ?? null,
-          });
-        });
-
-        if (reports.length > 0) {
-          debugLog("sender.stats.audio", {
-            selectedVideoId,
-            reports,
-          });
+        const state = activeVideoAdaptationState;
+        if (state && state.selectedVideoId === selectedVideoId && state.sender.track?.readyState === "live") {
+          updateAdaptiveVideoQualityFromStats(stats, state);
         }
+        maybeLogAudioSenderStats(stats, selectedVideoId);
       })
       .catch((error) => {
         const reason = error instanceof Error ? error.message : "getStats failed";
-        debugLog("sender.stats.audio.failed", {
+        debugLog("sender.stats.failed", {
           selectedVideoId,
           reason,
         });
@@ -621,7 +789,7 @@ function startSenderStatsProbe(peer: RTCPeerConnection, selectedVideoId: string)
       .finally(() => {
         inFlight = false;
       });
-  }, 5000);
+  }, FLOAT_VIDEO_ADAPTIVE_STATS_INTERVAL_MS);
 }
 
 function stopSenderStatsProbe(): void {
@@ -629,6 +797,7 @@ function stopSenderStatsProbe(): void {
     window.clearInterval(senderStatsTimerId);
     senderStatsTimerId = null;
   }
+  activeVideoAdaptationState = null;
 }
 
 function applyCodecPreferences(
@@ -682,9 +851,7 @@ async function applyTrackQualitySettings(
 
   try {
     await videoTrack.applyConstraints({
-      width: { max: FLOAT_MAX_VIDEO_WIDTH, ideal: FLOAT_MAX_VIDEO_WIDTH },
-      height: { max: FLOAT_MAX_VIDEO_HEIGHT, ideal: FLOAT_MAX_VIDEO_HEIGHT },
-      frameRate: { ideal: FLOAT_MAX_VIDEO_FPS },
+      frameRate: { ideal: FLOAT_MAX_VIDEO_FPS, max: FLOAT_MAX_VIDEO_FPS },
     });
   } catch (error) {
     const reason = error instanceof Error ? error.message : "video applyConstraints failed";
@@ -727,6 +894,7 @@ async function applyTrackQualitySettings(
 async function applySenderQualitySettings(
   sender: RTCRtpSender,
   selectedVideoId: string,
+  videoProfileId: VideoQualityProfileId = "high",
 ): Promise<void> {
   const kind = sender.track?.kind;
   if (kind !== "audio" && kind !== "video") {
@@ -743,12 +911,18 @@ async function applySenderQualitySettings(
   primaryEncoding.priority = "high";
 
   if (kind === "video") {
+    const profile = getVideoQualityProfile(videoProfileId);
     const videoSettings = sender.track?.getSettings();
-    const scaleResolutionDownBy = computeScaleResolutionDownBy(videoSettings?.width, videoSettings?.height);
-    primaryEncoding.maxBitrate = FLOAT_VIDEO_MAX_BITRATE_BPS;
-    primaryEncoding.maxFramerate = FLOAT_MAX_VIDEO_FPS;
+    const scaleResolutionDownBy = computeScaleResolutionDownBy(
+      videoSettings?.width,
+      videoSettings?.height,
+      profile.maxWidth,
+      profile.maxHeight,
+    );
+    primaryEncoding.maxBitrate = profile.maxBitrateBps;
+    primaryEncoding.maxFramerate = profile.maxFramerate;
     primaryEncoding.scaleResolutionDownBy = scaleResolutionDownBy;
-    parameters.degradationPreference = "maintain-resolution";
+    parameters.degradationPreference = profile.degradationPreference;
   } else {
     primaryEncoding.maxBitrate = FLOAT_AUDIO_MAX_BITRATE_BPS;
   }
@@ -776,7 +950,6 @@ async function applySenderQualitySettings(
 }
 
 function stopStreaming(): void {
-  stopSourceProbe();
   stopSenderStatsProbe();
 
   if (activePeer) {
@@ -829,7 +1002,6 @@ async function startStreaming(videoId: string): Promise<void> {
     readyState: video.readyState,
     paused: video.paused,
   });
-  startSourceProbe(video, selectedVideoId);
 
   let stream: MediaStream;
   try {
@@ -879,6 +1051,7 @@ async function startStreaming(videoId: string): Promise<void> {
     applyCodecPreferences(peer, sender, selectedVideoId);
   });
   await Promise.all(senders.map((sender) => applySenderQualitySettings(sender, selectedVideoId)));
+  const primaryVideoSender = senders.find((sender) => sender.track?.kind === "video") ?? null;
 
   peer.onicecandidate = (event) => {
     if (!event.candidate) {
@@ -932,7 +1105,7 @@ async function startStreaming(videoId: string): Promise<void> {
     activeStream = stream;
     activeVideoId = selectedVideoId;
     activeSourceVideo = video;
-    startSenderStatsProbe(peer, selectedVideoId);
+    startSenderStatsProbe(peer, selectedVideoId, primaryVideoSender);
 
     chrome.runtime.sendMessage({
       type: "float:webrtc:offer",
