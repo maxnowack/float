@@ -96,6 +96,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     func handleOffer(_ offer: OfferMessage) async throws -> String {
         currentTabId = offer.tabId
         currentVideoId = offer.videoId
+        pipController.setPiPContentReady(false)
 
         pipController.stop()
         clearActivePeerConnection(notifyStreamingStopped: false)
@@ -210,6 +211,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func clearActivePeerConnection(notifyStreamingStopped: Bool) {
+        pipController.setPiPContentReady(false)
         stopStatsProbe()
         pendingRemoteCandidates.removeAll()
         lastVideoInboundSnapshot = nil
@@ -248,7 +250,6 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         track.isEnabled = true
         track.add(videoView)
         startStatsProbeIfNeeded()
-        pipController.requestStart()
         onStreamingChanged?(true)
 
         log("track.attach kind=video trackId=\(track.trackId)")
@@ -806,6 +807,7 @@ extension NativeLibWebRTCReceiver: RTCVideoViewDelegate {
             guard size.width > 0, size.height > 0 else { return }
             self.lastReportedVideoSize = size
             self.pipController.updateExpectedVideoSize(size)
+            self.pipController.setPiPContentReady(true)
             self.pipController.requestStart()
             self.onStreamingChanged?(true)
         }

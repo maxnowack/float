@@ -50,10 +50,10 @@ final class NativePiPController: NSObject {
     private var playbackIsPlaying = true
     private var playbackDurationSeconds: Double = 0
     private var lastReportedPiPRenderSize = CGSize.zero
+    private var isPiPContentReady = false
 
     override init() {
         super.init()
-        setupIfNeeded()
     }
 
     deinit {
@@ -89,15 +89,34 @@ final class NativePiPController: NSObject {
     }
 
     func requestStart() {
+        setupIfNeeded()
         suppressPlaybackCommands = false
         wantsStart = true
         attemptStartPiP()
+    }
+
+    func setPiPContentReady(_ ready: Bool) {
+        guard isPiPContentReady != ready else { return }
+        isPiPContentReady = ready
+        if ready {
+            setupIfNeeded()
+        }
+        if !ready {
+            if privatePiPPresented {
+                stop()
+            }
+            return
+        }
+        if wantsStart {
+            attemptStartPiP()
+        }
     }
 
     func stop() {
         suppressPlaybackCommands = true
         wantsStart = false
         isStartingPictureInPicture = false
+        isPiPContentReady = false
 
         guard privatePiPPresented else { return }
 
@@ -215,12 +234,7 @@ final class NativePiPController: NSObject {
     }
 
     private func setupPrivatePiPController() -> Bool {
-        let path = "/System/Library/PrivateFrameworks/PIP.framework/Versions/A/PIP"
-        guard dlopen(path, RTLD_NOW) != nil else {
-            return false
-        }
-
-        guard let pipClass = NSClassFromString("PIPViewController") as? NSObject.Type else {
+        guard let pipClass = loadPrivatePiPClass() else {
             return false
         }
 
@@ -249,6 +263,37 @@ final class NativePiPController: NSObject {
         isObservingPrivatePiPPlaying = true
         applyPrivatePiPAspectConstraints()
         return true
+    }
+
+    private func loadPrivatePiPClass() -> NSObject.Type? {
+        if let pipClass = NSClassFromString("PIPViewController") as? NSObject.Type {
+            return pipClass
+        }
+
+        let fallbackPaths = [
+            "/System/Library/PrivateFrameworks/PIP.framework/PIP",
+            "/System/Library/PrivateFrameworks/PIP.framework/Versions/A/PIP",
+        ]
+
+        for path in fallbackPaths {
+            _ = dlerror()
+            guard dlopen(path, RTLD_NOW | RTLD_GLOBAL) != nil else {
+                if let errorPointer = dlerror() {
+                    print("[Float PiP] dlopen failed path=\(path) error=\(String(cString: errorPointer))")
+                } else {
+                    print("[Float PiP] dlopen failed path=\(path)")
+                }
+                continue
+            }
+
+            if let pipClass = NSClassFromString("PIPViewController") as? NSObject.Type {
+                print("[Float PiP] loaded private framework path=\(path)")
+                return pipClass
+            }
+        }
+
+        print("[Float PiP] PIPViewController class unavailable")
+        return nil
     }
 
     private func ensurePrivatePiPDelegateProtocolConformance() {
@@ -280,6 +325,7 @@ final class NativePiPController: NSObject {
 
     private func attemptStartPiP() {
         guard wantsStart else { return }
+        guard isPiPContentReady else { return }
         guard !privatePiPPresented else { return }
         guard !isStartingPictureInPicture else { return }
         guard let privatePiPController else { return }
@@ -657,6 +703,10 @@ final class NativePiPController: NSObject {
 
         privatePiPPanel = panel
         guard let panel else { return }
+
+        // Keep the private PiP panel available across spaces/fullscreen workflows.
+        panel.collectionBehavior.insert(.canJoinAllSpaces)
+        panel.collectionBehavior.insert(.fullScreenAuxiliary)
 
         privatePiPPanelCloseObserver = NotificationCenter.default.addObserver(
             forName: NSWindow.willCloseNotification,
