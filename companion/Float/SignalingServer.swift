@@ -1,6 +1,7 @@
 import Combine
 import Foundation
 import Network
+import ServiceManagement
 
 private let diagnosticsOverlayDefaultsKey = "Float.diagnosticsOverlayEnabled"
 
@@ -10,6 +11,8 @@ private func loadDiagnosticsOverlayEnabled() -> Bool {
 
 @MainActor
 final class SignalingServer: ObservableObject {
+    private static let launchAtLoginUnavailableMessage = "Start at Login is not supported on this macOS version."
+
     enum ServerState {
         case starting
         case waiting
@@ -68,6 +71,7 @@ final class SignalingServer: ObservableObject {
     @Published private(set) var lastExtensionDebugLog: String?
     @Published private(set) var autoStartBackgroundEnabled = false
     @Published private(set) var autoStopForegroundEnabled = true
+    @Published private(set) var launchAtLoginEnabled = false
     @Published private(set) var diagnosticsOverlayEnabled = true
 
     struct VideoSource: Identifiable {
@@ -114,6 +118,7 @@ final class SignalingServer: ObservableObject {
     init() {
         autoStartBackgroundEnabled = UserDefaults.standard.object(forKey: Self.autoStartBackgroundDefaultsKey) as? Bool ?? false
         autoStopForegroundEnabled = UserDefaults.standard.object(forKey: Self.autoStopForegroundDefaultsKey) as? Bool ?? true
+        launchAtLoginEnabled = Self.resolveLaunchAtLoginEnabled()
         diagnosticsOverlayEnabled = loadDiagnosticsOverlayEnabled()
         var receiver = makeWebRTCReceiver()
         self.webRTCReceiver = receiver
@@ -256,6 +261,30 @@ final class SignalingServer: ObservableObject {
         broadcastAutoStopForegroundSetting()
     }
 
+    func refreshLaunchAtLoginState() {
+        launchAtLoginEnabled = Self.resolveLaunchAtLoginEnabled()
+    }
+
+    func setLaunchAtLoginEnabled(_ enabled: Bool) {
+        guard #available(macOS 13.0, *) else {
+            launchAtLoginEnabled = false
+            lastError = Self.launchAtLoginUnavailableMessage
+            return
+        }
+
+        do {
+            if enabled {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+        } catch {
+            launchAtLoginEnabled = SMAppService.mainApp.status == .enabled
+            lastError = "Failed to update Start at Login: \(error.localizedDescription)"
+        }
+    }
+
     func setDiagnosticsOverlayEnabled(_ enabled: Bool) {
         guard diagnosticsOverlayEnabled != enabled else {
             return
@@ -264,6 +293,13 @@ final class SignalingServer: ObservableObject {
         diagnosticsOverlayEnabled = enabled
         UserDefaults.standard.set(enabled, forKey: diagnosticsOverlayDefaultsKey)
         webRTCReceiver.setDiagnosticsOverlayEnabled(enabled)
+    }
+
+    private static func resolveLaunchAtLoginEnabled() -> Bool {
+        guard #available(macOS 13.0, *) else {
+            return false
+        }
+        return SMAppService.mainApp.status == .enabled
     }
 
     func isActiveSource(_ source: VideoSource) -> Bool {

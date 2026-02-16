@@ -122,6 +122,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func presentQuitMenu() {
+        signalingServer.refreshLaunchAtLoginState()
         let menu = NSMenu()
 
         let autoStartItem = NSMenuItem(
@@ -141,6 +142,15 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         autoStopItem.target = self
         autoStopItem.state = signalingServer.autoStopForegroundEnabled ? .on : .off
         menu.addItem(autoStopItem)
+
+        let launchAtLoginItem = NSMenuItem(
+            title: "Start at Login",
+            action: #selector(handleLaunchAtLoginToggled(_:)),
+            keyEquivalent: ""
+        )
+        launchAtLoginItem.target = self
+        launchAtLoginItem.state = signalingServer.launchAtLoginEnabled ? .on : .off
+        menu.addItem(launchAtLoginItem)
 
         let fpsOverlayItem = NSMenuItem(
             title: "FPS Overlay",
@@ -188,6 +198,12 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         let enabled = sender.state != .on
         signalingServer.setAutoStopForegroundEnabled(enabled)
         sender.state = enabled ? .on : .off
+    }
+
+    @objc private func handleLaunchAtLoginToggled(_ sender: NSMenuItem) {
+        let enabled = sender.state != .on
+        signalingServer.setLaunchAtLoginEnabled(enabled)
+        sender.state = signalingServer.launchAtLoginEnabled ? .on : .off
     }
 
     @objc private func handleFPSOverlayToggled(_ sender: NSMenuItem) {
