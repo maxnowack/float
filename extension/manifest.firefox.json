@@ -1,0 +1,55 @@
+{
+  "manifest_version": 3,
+  "name": "Float",
+  "version": "0.1.2",
+  "description": "Detects playing videos and coordinates with the Float macOS companion.",
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "permissions": [
+    "tabs"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1/*",
+    "http://localhost/*",
+    "<all_urls>"
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src ws://127.0.0.1:17891 ws://localhost:17891 http://127.0.0.1:17891 http://localhost:17891;"
+  },
+  "background": {
+    "scripts": [
+      "dist/protocol.js",
+      "dist/service_worker.js"
+    ]
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "<all_urls>"
+      ],
+      "js": [
+        "dist/protocol.js",
+        "dist/content_script.js"
+      ],
+      "all_frames": true,
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "Float",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png"
+    }
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "float@maxnowack.dev",
+      "strict_min_version": "121.0"
+    }
+  }
+}

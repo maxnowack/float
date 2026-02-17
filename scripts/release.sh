@@ -81,15 +81,16 @@ bump_versions() {
 
   node -e '
 const fs = require("fs");
-const [manifestPath, packagePath, version] = process.argv.slice(1);
-for (const path of [manifestPath, packagePath]) {
+const [manifestChromePath, manifestFirefoxPath, packagePath, version] = process.argv.slice(1);
+for (const path of [manifestChromePath, manifestFirefoxPath, packagePath]) {
   const data = JSON.parse(fs.readFileSync(path, "utf8"));
   data.version = version;
   fs.writeFileSync(path, `${JSON.stringify(data, null, 2)}\n`);
 }
 ' \
-    "$ROOT_DIR/chrome/manifest.json" \
-    "$ROOT_DIR/chrome/package.json" \
+    "$ROOT_DIR/extension/manifest.chrome.json" \
+    "$ROOT_DIR/extension/manifest.firefox.json" \
+    "$ROOT_DIR/extension/package.json" \
     "$version"
 
   perl -i -pe "s/MARKETING_VERSION = [0-9]+\\.[0-9]+\\.[0-9]+;/MARKETING_VERSION = $version;/g" \
@@ -203,8 +204,9 @@ fi
 bump_versions "$VERSION" "$BUILD_NUMBER"
 
 git add \
-  "$ROOT_DIR/chrome/manifest.json" \
-  "$ROOT_DIR/chrome/package.json" \
+  "$ROOT_DIR/extension/manifest.chrome.json" \
+  "$ROOT_DIR/extension/manifest.firefox.json" \
+  "$ROOT_DIR/extension/package.json" \
   "$ROOT_DIR/companion/Float.xcodeproj/project.pbxproj"
 
 if [[ -z "$(git diff --cached --name-only)" ]]; then

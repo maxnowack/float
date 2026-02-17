@@ -1,10 +1,137 @@
 declare function importScripts(...urls: string[]): void;
 
-importScripts("./protocol.js");
+const maybeImportScripts = (globalThis as any).importScripts as
+  | ((...urls: string[]) => void)
+  | undefined;
+if (typeof maybeImportScripts === "function") {
+  maybeImportScripts("./protocol.js");
+}
 
 const companionPort = 17891;
 const companionUrl = `ws://127.0.0.1:${companionPort}`;
 const debugLogEnabled = false;
+const serviceWorkerExt: any = (globalThis as any).chrome ?? (globalThis as any).browser;
+const isFirefoxExtension = serviceWorkerExt === (globalThis as any).browser;
+const shouldMuteSourceTabDuringStreaming = !isFirefoxExtension;
+
+function ensureProtocolGlobals(): void {
+  const scope = globalThis as any;
+  if (scope.FloatProtocol) {
+    return;
+  }
+
+  scope.FloatProtocol = {
+    version: 1,
+    messageType: {
+      hello: "hello",
+      state: "state",
+      start: "start",
+      offer: "offer",
+      answer: "answer",
+      ice: "ice",
+      stop: "stop",
+      playback: "playback",
+      seek: "seek",
+      qualityHint: "qualityHint",
+      autoStartBackground: "autoStartBackground",
+      autoStopForeground: "autoStopForeground",
+      error: "error",
+      debug: "debug",
+    },
+  };
+
+  type SWUnknownRecord = Record<string, unknown>;
+  const isRecord = (value: unknown): value is SWUnknownRecord =>
+    typeof value === "object" && value !== null;
+  const readType = (message: unknown): string | null => {
+    if (!isRecord(message)) {
+      return null;
+    }
+    const value = message.type;
+    return typeof value === "string" ? value : null;
+  };
+  scope.FloatProtocolReadTypeField = readType;
+  scope.FloatProtocolError = (reason: string) => ({
+    type: scope.FloatProtocol.messageType.error,
+    reason,
+  });
+  scope.FloatProtocolIsStartMessage = (message: unknown): boolean =>
+    isRecord(message) &&
+    message.type === scope.FloatProtocol.messageType.start &&
+    typeof message.tabId === "number" &&
+    typeof message.videoId === "string";
+  scope.FloatProtocolIsStopMessage = (message: unknown): boolean =>
+    isRecord(message) && message.type === scope.FloatProtocol.messageType.stop;
+  scope.FloatProtocolIsAutoStartBackgroundMessage = (message: unknown): boolean =>
+    isRecord(message) &&
+    message.type === scope.FloatProtocol.messageType.autoStartBackground &&
+    typeof message.enabled === "boolean";
+  scope.FloatProtocolIsAutoStopForegroundMessage = (message: unknown): boolean =>
+    isRecord(message) &&
+    message.type === scope.FloatProtocol.messageType.autoStopForeground &&
+    typeof message.enabled === "boolean";
+  scope.FloatProtocolIsPlaybackMessage = (message: unknown): boolean =>
+    isRecord(message) &&
+    message.type === scope.FloatProtocol.messageType.playback &&
+    typeof message.tabId === "number" &&
+    typeof message.videoId === "string" &&
+    typeof message.playing === "boolean";
+  scope.FloatProtocolIsSeekMessage = (message: unknown): boolean =>
+    isRecord(message) &&
+    message.type === scope.FloatProtocol.messageType.seek &&
+    typeof message.tabId === "number" &&
+    typeof message.videoId === "string" &&
+    typeof message.intervalSeconds === "number";
+  scope.FloatProtocolIsQualityHintMessage = (message: unknown): boolean => {
+    if (!isRecord(message)) {
+      return false;
+    }
+    const profile = message.profile;
+    const validProfile =
+      profile === "high" || profile === "balanced" || profile === "performance";
+    const pipWidth = message.pipWidth;
+    const pipHeight = message.pipHeight;
+    const noPiPSize =
+      typeof pipWidth === "undefined" && typeof pipHeight === "undefined";
+    const hasPiPSize =
+      typeof pipWidth === "number" &&
+      Number.isFinite(pipWidth) &&
+      pipWidth > 0 &&
+      typeof pipHeight === "number" &&
+      Number.isFinite(pipHeight) &&
+      pipHeight > 0;
+    return (
+      message.type === scope.FloatProtocol.messageType.qualityHint &&
+      typeof message.tabId === "number" &&
+      typeof message.videoId === "string" &&
+      validProfile &&
+      (noPiPSize || hasPiPSize)
+    );
+  };
+  scope.FloatProtocolIsAnswerMessage = (message: unknown): boolean =>
+    isRecord(message) &&
+    message.type === scope.FloatProtocol.messageType.answer &&
+    typeof message.tabId === "number" &&
+    typeof message.videoId === "string" &&
+    typeof message.sdp === "string";
+  scope.FloatProtocolIsIceMessage = (message: unknown): boolean => {
+    if (!isRecord(message)) {
+      return false;
+    }
+    const mid = message.sdpMid;
+    const mLine = message.sdpMLineIndex;
+    return (
+      message.type === scope.FloatProtocol.messageType.ice &&
+      typeof message.tabId === "number" &&
+      typeof message.videoId === "string" &&
+      typeof message.candidate === "string" &&
+      (typeof mid === "string" || mid === null) &&
+      (typeof mLine === "number" || mLine === null)
+    );
+  };
+}
+
+ensureProtocolGlobals();
 
 type WorkerVideoCandidate = {
   videoId: string;
@@ -37,11 +164,13 @@ type MutedTabState = {
 const frameStateByTab = new Map<number, Map<string, FrameState>>();
 let socket: WebSocket | null = null;
 let reconnectTimer: number | null = null;
-let activeStreamTarget: { tabId: number; videoId: string } | null = null;
+let activeStreamTarget: { tabId: number; videoId: string; frameId: number | null } | null = null;
 let mutedTabState: MutedTabState | null = null;
 let desiredMutedTabId: number | null = null;
 let autoStartBackgroundEnabled = false;
 let autoStopForegroundEnabled = true;
+const pendingSocketMessages: unknown[] = [];
+const MAX_PENDING_SOCKET_MESSAGES = 256;
 
 function log(message: string, payload?: unknown): void {
   if (!debugLogEnabled) {
@@ -53,6 +182,88 @@ function log(message: string, payload?: unknown): void {
   } else {
     console.log(`[Float SW] ${message}`, payload);
   }
+}
+
+function isMissingReceiverError(reason: string): boolean {
+  const normalized = reason.toLowerCase();
+  return (
+    normalized.includes("receiving end does not exist") ||
+    normalized.includes("message manager disconnected") ||
+    normalized.includes("could not establish connection")
+  );
+}
+
+function sendMessageToTab(
+  tabId: number,
+  message: unknown,
+  options?: { frameId?: number },
+  onError?: (reason: string) => void,
+): void {
+  const handleError = (reason: string) => {
+    log("tabs.sendMessage failed", { tabId, message, reason, options: options ?? null });
+    onError?.(reason);
+  };
+
+  try {
+    if (isFirefoxExtension) {
+      const maybePromise = options
+        ? serviceWorkerExt.tabs.sendMessage(tabId, message, options)
+        : serviceWorkerExt.tabs.sendMessage(tabId, message);
+      if (maybePromise && typeof maybePromise.then === "function") {
+        maybePromise.catch((error: unknown) => {
+          const reason = error instanceof Error ? error.message : String(error);
+          handleError(reason);
+        });
+      }
+      return;
+    }
+
+    const callback = () => {
+      const reason = serviceWorkerExt.runtime.lastError?.message;
+      if (typeof reason === "string" && reason.length > 0) {
+        handleError(reason);
+      }
+    };
+    if (options) {
+      serviceWorkerExt.tabs.sendMessage(tabId, message, options, callback);
+    } else {
+      serviceWorkerExt.tabs.sendMessage(tabId, message, callback);
+    }
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    handleError(reason);
+  }
+}
+
+function activeTargetFrameId(tabId: number, videoId: string): number | null {
+  if (!activeStreamTarget) {
+    return null;
+  }
+  if (activeStreamTarget.tabId !== tabId || activeStreamTarget.videoId !== videoId) {
+    return null;
+  }
+  return typeof activeStreamTarget.frameId === "number" ? activeStreamTarget.frameId : null;
+}
+
+function sendSignalMessageToActiveTarget(
+  tabId: number,
+  videoId: string,
+  message: unknown,
+  retryAttempt = 0,
+): void {
+  const frameId = activeTargetFrameId(tabId, videoId);
+  const options = typeof frameId === "number" ? { frameId } : undefined;
+  sendMessageToTab(tabId, message, options, (reason) => {
+    if (!isMissingReceiverError(reason)) {
+      return;
+    }
+    if (retryAttempt >= 5) {
+      return;
+    }
+    self.setTimeout(() => {
+      sendSignalMessageToActiveTarget(tabId, videoId, message, retryAttempt + 1);
+    }, 120 * (retryAttempt + 1));
+  });
 }
 
 function connectToCompanion(): void {
@@ -71,6 +282,7 @@ function connectToCompanion(): void {
     };
     sendSocketMessage(hello);
     sendState();
+    flushPendingSocketMessages();
   });
 
   socket.addEventListener("message", (event) => {
@@ -99,10 +311,10 @@ function stopStreamingAfterCompanionDisconnect(): void {
   desiredMutedTabId = null;
   restoreMutedTabIfNeeded();
 
-  chrome.tabs.query({}, (tabs: any[]) => {
+  serviceWorkerExt.tabs.query({}, (tabs: any[]) => {
     tabs.forEach((tab) => {
       if (typeof tab.id === "number") {
-        chrome.tabs.sendMessage(tab.id, { type: "float:stop" });
+        sendMessageToTab(tab.id, { type: "float:stop" });
       }
     });
   });
@@ -121,11 +333,48 @@ function scheduleReconnect(): void {
 
 function sendSocketMessage(payload: unknown): void {
   if (!socket || socket.readyState !== WebSocket.OPEN) {
+    queueSocketMessage(payload);
+    connectToCompanion();
     return;
   }
 
   socket.send(JSON.stringify(payload));
   log("-> companion", payload);
+}
+
+function flushPendingSocketMessages(): void {
+  if (!socket || socket.readyState !== WebSocket.OPEN) {
+    return;
+  }
+
+  while (pendingSocketMessages.length > 0) {
+    const payload = pendingSocketMessages.shift();
+    if (typeof payload === "undefined") {
+      continue;
+    }
+    socket.send(JSON.stringify(payload));
+    log("-> companion (flushed)", payload);
+  }
+}
+
+function queueSocketMessage(payload: unknown): void {
+  const payloadType = FloatProtocolReadTypeField(payload);
+  if (payloadType === FloatProtocol.messageType.debug) {
+    return;
+  }
+
+  if (payloadType === FloatProtocol.messageType.state) {
+    for (let i = pendingSocketMessages.length - 1; i >= 0; i -= 1) {
+      if (FloatProtocolReadTypeField(pendingSocketMessages[i]) === FloatProtocol.messageType.state) {
+        pendingSocketMessages.splice(i, 1);
+      }
+    }
+  }
+
+  pendingSocketMessages.push(payload);
+  if (pendingSocketMessages.length > MAX_PENDING_SOCKET_MESSAGES) {
+    pendingSocketMessages.splice(0, pendingSocketMessages.length - MAX_PENDING_SOCKET_MESSAGES);
+  }
 }
 
 function sendProtocolError(reason: string): void {
@@ -141,21 +390,18 @@ function chooseAutoStartVideo(videos: WorkerVideoCandidate[]): WorkerVideoCandid
 }
 
 function sendStartToTab(tabId: number, videoId: string): void {
-  activeStreamTarget = { tabId, videoId };
-  desiredMutedTabId = tabId;
+  activeStreamTarget = { tabId, videoId, frameId: null };
+  desiredMutedTabId = shouldMuteSourceTabDuringStreaming ? tabId : null;
 
-  chrome.tabs.sendMessage(
+  sendMessageToTab(
     tabId,
     {
       type: "float:start",
       videoId,
     },
-    () => {
-      if (!chrome.runtime.lastError) {
-        return;
-      }
-
-      log("Failed to send start message", chrome.runtime.lastError.message);
+    undefined,
+    (reason) => {
+      log("Failed to send start message", reason);
       if (activeStreamTarget?.tabId === tabId && activeStreamTarget.videoId === videoId) {
         activeStreamTarget = null;
       }
@@ -195,19 +441,15 @@ function stopStreamForForegroundTab(tabId: number): void {
   desiredMutedTabId = null;
   restoreMutedTabIfNeeded(sourceTabId);
 
-  chrome.tabs.sendMessage(sourceTabId, { type: "float:stop" }, () => {
-    if (!chrome.runtime.lastError) {
-      return;
-    }
-
-    log("Failed to send stop message for foreground tab", chrome.runtime.lastError.message);
+  sendMessageToTab(sourceTabId, { type: "float:stop" }, undefined, (reason) => {
+    log("Failed to send stop message for foreground tab", reason);
     sendSocketMessage({ type: FloatProtocol.messageType.stop });
   });
 }
 
 function unmuteTabIfNeeded(tabId: number): void {
-  chrome.tabs.get(tabId, (tab: any) => {
-    if (chrome.runtime.lastError) {
+  serviceWorkerExt.tabs.get(tabId, (tab: any) => {
+    if (serviceWorkerExt.runtime.lastError) {
       return;
     }
 
@@ -217,15 +459,19 @@ function unmuteTabIfNeeded(tabId: number): void {
       return;
     }
 
-    chrome.tabs.update(tabId, { muted: false }, () => {
-      if (chrome.runtime.lastError) {
-        log("Failed to restore tab mute state", chrome.runtime.lastError.message);
+    serviceWorkerExt.tabs.update(tabId, { muted: false }, () => {
+      if (serviceWorkerExt.runtime.lastError) {
+        log("Failed to restore tab mute state", serviceWorkerExt.runtime.lastError.message);
       }
     });
   });
 }
 
 function muteTabForStreaming(tabId: number): void {
+  if (!shouldMuteSourceTabDuringStreaming) {
+    return;
+  }
+
   desiredMutedTabId = tabId;
 
   if (mutedTabState && mutedTabState.tabId === tabId) {
@@ -235,13 +481,13 @@ function muteTabForStreaming(tabId: number): void {
     restoreMutedTabIfNeeded(mutedTabState.tabId);
   }
 
-  chrome.tabs.get(tabId, (tab: any) => {
+  serviceWorkerExt.tabs.get(tabId, (tab: any) => {
     if (desiredMutedTabId !== tabId) {
       return;
     }
 
-    if (chrome.runtime.lastError) {
-      log("Failed to inspect tab mute state", chrome.runtime.lastError.message);
+    if (serviceWorkerExt.runtime.lastError) {
+      log("Failed to inspect tab mute state", serviceWorkerExt.runtime.lastError.message);
       return;
     }
 
@@ -251,9 +497,9 @@ function muteTabForStreaming(tabId: number): void {
       return;
     }
 
-    chrome.tabs.update(tabId, { muted: true }, () => {
-      if (chrome.runtime.lastError) {
-        log("Failed to mute tab", chrome.runtime.lastError.message);
+    serviceWorkerExt.tabs.update(tabId, { muted: true }, () => {
+      if (serviceWorkerExt.runtime.lastError) {
+        log("Failed to mute tab", serviceWorkerExt.runtime.lastError.message);
         if (mutedTabState?.tabId === tabId) {
           mutedTabState = null;
         }
@@ -274,6 +520,10 @@ function muteTabForStreaming(tabId: number): void {
 }
 
 function restoreMutedTabIfNeeded(tabId?: number): void {
+  if (!shouldMuteSourceTabDuringStreaming) {
+    return;
+  }
+
   if (!mutedTabState) {
     return;
   }
@@ -352,8 +602,12 @@ function onOfferFromContent(message: any, sender: any): void {
   }
 
   muteTabForStreaming(tabId);
-  activeStreamTarget = { tabId, videoId: message.videoId };
-  desiredMutedTabId = tabId;
+  activeStreamTarget = {
+    tabId,
+    videoId: message.videoId,
+    frameId: typeof sender?.frameId === "number" ? sender.frameId : null,
+  };
+  desiredMutedTabId = shouldMuteSourceTabDuringStreaming ? tabId : null;
 
   sendSocketMessage({
     type: FloatProtocol.messageType.offer,
@@ -500,10 +754,10 @@ function handleCompanionMessage(raw: unknown): void {
     activeStreamTarget = null;
     desiredMutedTabId = null;
     restoreMutedTabIfNeeded();
-    chrome.tabs.query({}, (tabs: any[]) => {
+    serviceWorkerExt.tabs.query({}, (tabs: any[]) => {
       tabs.forEach((tab) => {
         if (typeof tab.id === "number") {
-          chrome.tabs.sendMessage(tab.id, { type: "float:stop" });
+          sendMessageToTab(tab.id, { type: "float:stop" });
         }
       });
     });
@@ -521,7 +775,7 @@ function handleCompanionMessage(raw: unknown): void {
   }
 
   if (FloatProtocolIsPlaybackMessage(parsed)) {
-    chrome.tabs.sendMessage(parsed.tabId, {
+    sendSignalMessageToActiveTarget(parsed.tabId, parsed.videoId, {
       type: "float:playback",
       videoId: parsed.videoId,
       playing: parsed.playing,
@@ -530,7 +784,7 @@ function handleCompanionMessage(raw: unknown): void {
   }
 
   if (FloatProtocolIsSeekMessage(parsed)) {
-    chrome.tabs.sendMessage(parsed.tabId, {
+    sendSignalMessageToActiveTarget(parsed.tabId, parsed.videoId, {
       type: "float:seek",
       videoId: parsed.videoId,
       intervalSeconds: parsed.intervalSeconds,
@@ -539,7 +793,7 @@ function handleCompanionMessage(raw: unknown): void {
   }
 
   if (FloatProtocolIsQualityHintMessage(parsed)) {
-    chrome.tabs.sendMessage(parsed.tabId, {
+    sendSignalMessageToActiveTarget(parsed.tabId, parsed.videoId, {
       type: "float:qualityHint",
       videoId: parsed.videoId,
       profile: parsed.profile,
@@ -550,7 +804,7 @@ function handleCompanionMessage(raw: unknown): void {
   }
 
   if (FloatProtocolIsAnswerMessage(parsed)) {
-    chrome.tabs.sendMessage(parsed.tabId, {
+    sendSignalMessageToActiveTarget(parsed.tabId, parsed.videoId, {
       type: "float:signal:answer",
       videoId: parsed.videoId,
       sdp: parsed.sdp,
@@ -559,7 +813,7 @@ function handleCompanionMessage(raw: unknown): void {
   }
 
   if (FloatProtocolIsIceMessage(parsed)) {
-    chrome.tabs.sendMessage(parsed.tabId, {
+    sendSignalMessageToActiveTarget(parsed.tabId, parsed.videoId, {
       type: "float:signal:ice",
       videoId: parsed.videoId,
       candidate: parsed.candidate,
@@ -572,15 +826,21 @@ function handleCompanionMessage(raw: unknown): void {
   sendProtocolError(`Unsupported companion message type: ${parsedType ?? "unknown"}`);
 }
 
-chrome.runtime.onInstalled.addListener(() => {
+serviceWorkerExt.runtime.onInstalled.addListener(() => {
   connectToCompanion();
 });
 
-chrome.runtime.onStartup.addListener(() => {
+serviceWorkerExt.runtime.onStartup.addListener(() => {
   connectToCompanion();
 });
 
-chrome.runtime.onMessage.addListener((message: any, sender: any) => {
+// Firefox background scripts can load without firing onStartup/onInstalled immediately.
+// Connect eagerly so float:videos:update state can be forwarded right away.
+connectToCompanion();
+
+serviceWorkerExt.runtime.onMessage.addListener((message: any, sender: any) => {
+  connectToCompanion();
+
   if (!message || typeof message.type !== "string") {
     return;
   }
@@ -647,7 +907,7 @@ chrome.runtime.onMessage.addListener((message: any, sender: any) => {
   }
 });
 
-chrome.tabs.onRemoved.addListener((tabId: number) => {
+serviceWorkerExt.tabs.onRemoved.addListener((tabId: number) => {
   frameStateByTab.delete(tabId);
   if (mutedTabState?.tabId === tabId) {
     mutedTabState = null;

@@ -1,0 +1,14 @@
+{
+  "name": "float-extension",
+  "private": true,
+  "version": "0.1.2",
+  "scripts": {
+    "build": "yarn build:base",
+    "build:base": "tsc -p tsconfig.json",
+    "build:chrome": "yarn build:base && mkdir -p ../build/chrome-extension && cp ./manifest.chrome.json ../build/chrome-extension/manifest.json",
+    "build:firefox": "yarn build:base && mkdir -p ../build/firefox-extension && cp ./manifest.firefox.json ../build/firefox-extension/manifest.json"
+  },
+  "devDependencies": {
+    "typescript": "5.8.2"
+  }
+}

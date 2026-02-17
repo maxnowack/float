@@ -3,20 +3,21 @@
 ## Overview
 Float is a local browser-to-macOS Picture-in-Picture system:
 
-- `chrome/`: Chromium MV3 extension that detects page videos, captures a selected source via `captureStream()`, and streams it over WebRTC.
+- `extension/`: Shared browser extension source (Chrome + Firefox targets) that detects page videos, captures a selected source via `captureStream()`, and streams it over WebRTC.
 - `companion/`: macOS menu bar app that runs local signaling and presents the stream in native PiP.
 
 All signaling is local-only over `ws://127.0.0.1:17891`.
 
 ## Repository layout
 
-### Extension (`/Users/maxnowack/code/float/chrome`)
+### Extension (`/Users/maxnowack/code/float/extension`)
 
-- `/Users/maxnowack/code/float/chrome/manifest.json`: MV3 manifest, permissions, service worker, and content-script injection.
-- `/Users/maxnowack/code/float/chrome/src/protocol.ts`: protocol constants + runtime type guards (`start`, `stop`, `offer`, `answer`, `ice`, `playback`, `error`, `debug`).
-- `/Users/maxnowack/code/float/chrome/src/globals.d.ts`: global declarations for protocol helpers and `captureStream()`.
-- `/Users/maxnowack/code/float/chrome/src/service_worker.ts`: background bridge between tabs and companion WebSocket, tab/frame state aggregation, tab mute/unmute lifecycle while streaming, signaling forwarding.
-- `/Users/maxnowack/code/float/chrome/src/content_script.ts`: video discovery, candidate updates, WebRTC sender, debug probes, and playback control application (`float:playback`).
+- `/Users/maxnowack/code/float/extension/manifest.chrome.json`: Chrome MV3 manifest.
+- `/Users/maxnowack/code/float/extension/manifest.firefox.json`: Firefox-target manifest.
+- `/Users/maxnowack/code/float/extension/src/protocol.ts`: protocol constants + runtime type guards (`start`, `stop`, `offer`, `answer`, `ice`, `playback`, `error`, `debug`).
+- `/Users/maxnowack/code/float/extension/src/globals.d.ts`: global declarations for protocol helpers and capture APIs.
+- `/Users/maxnowack/code/float/extension/src/service_worker.ts`: background bridge between tabs and companion WebSocket, tab/frame state aggregation, tab mute/unmute lifecycle while streaming, signaling forwarding.
+- `/Users/maxnowack/code/float/extension/src/content_script.ts`: video discovery, candidate updates, WebRTC sender, debug probes, and playback control application (`float:playback`).
 
 ### Companion (`/Users/maxnowack/code/float/companion`)
 
@@ -53,12 +54,13 @@ Companion receiving is currently WebKit-based:
 
 ## Build and run
 
-Extension:
+Extension (shared source):
 
 ```bash
-cd /Users/maxnowack/code/float/chrome
+cd /Users/maxnowack/code/float/extension
 yarn install
-yarn build
+yarn build:chrome
+yarn build:firefox
 ```
 
 Companion:
@@ -67,7 +69,10 @@ Companion:
 xcodebuild -project /Users/maxnowack/code/float/companion/Float.xcodeproj -scheme Float -configuration Debug -sdk macosx build
 ```
 
-Then load `/Users/maxnowack/code/float/chrome` as an unpacked extension and run the macOS app.
+Then run packaging scripts and load either staged build output:
+
+- `/Users/maxnowack/code/float/build/chrome-extension`
+- `/Users/maxnowack/code/float/build/firefox-extension`
 
 ## Notes and caveats
 

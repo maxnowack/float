@@ -5,14 +5,19 @@ import WebRTC
 
 @MainActor
 final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
-    private static let opusRtpmapRegex = try! NSRegularExpression(
-        pattern: #"^a=rtpmap:(\d+)\s+opus/48000/2$"#,
-        options: [.caseInsensitive]
-    )
-    private static let fmtpPayloadRegex = try! NSRegularExpression(
-        pattern: #"^a=fmtp:(\d+)\s+"#,
-        options: [.caseInsensitive]
-    )
+    // ========================================================================
+    // AUDIO QUALITY CONFIGURATION
+    // ========================================================================
+    // Target audio bitrate in bits per second (bps)
+    // Must match the value in extension/src/content_script.ts
+    // Recommended values:
+    //   - 128000 (128 kbps): Good quality, lower bandwidth
+    //   - 192000 (192 kbps): Very good quality, balanced
+    //   - 256000 (256 kbps): Excellent quality (default)
+    //   - 510000 (510 kbps): Maximum Opus quality
+    private static let opusTargetBitrateBps: Int = 256_000
+    // ========================================================================
+    
     private static let terminalConnectionStates: Set<RTCPeerConnectionState> = [
         .disconnected, .failed, .closed,
     ]
@@ -53,6 +58,13 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private var lastVideoInboundSnapshot: VideoInboundSnapshot?
     private var smoothedVideoFPS: Double?
     private var lastReportedVideoSize = CGSize.zero
+    private var missingVideoInboundProbeCount = 0
+    private var hasLoggedVideoInbound = false
+    private var localIceCandidateCount = 0
+    private var remoteIceCandidateCount = 0
+    private var lastAudioBytesReceived: Double?
+    private var lastAudioStatsTime: Date?
+    private var audioStatsLogCount = 0
 
     override init() {
         if !Self.didInitializeFieldTrials {
@@ -94,6 +106,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     func handleOffer(_ offer: OfferMessage) async throws -> String {
+        info("offer.received tabId=\(offer.tabId) videoId=\(offer.videoId) sdpLength=\(offer.sdp.count)")
         currentTabId = offer.tabId
         currentVideoId = offer.videoId
         pipController.setPiPContentReady(false)
@@ -107,20 +120,17 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         do {
             let remoteOffer = RTCSessionDescription(type: .offer, sdp: offer.sdp)
             try await setRemoteDescription(remoteOffer, on: connection)
+            info("offer.remoteDescription.applied")
             try await flushPendingRemoteCandidates(on: connection)
 
             let createdAnswer = try await createAnswer(on: connection)
-            let stereoAnswerSdp = enforceStereoOpusInSdp(createdAnswer.sdp)
-            let localAnswer = RTCSessionDescription(type: .answer, sdp: stereoAnswerSdp)
+            let localAnswer = RTCSessionDescription(type: .answer, sdp: createdAnswer.sdp)
             try await setLocalDescription(localAnswer, on: connection)
+            info("answer.localDescription.applied sdpLength=\(createdAnswer.sdp.count)")
 
             try await flushPendingRemoteCandidates(on: connection)
 
-            let localSdp = connection.localDescription?.sdp ?? stereoAnswerSdp
-            let outboundAnswerSdp = enforceStereoOpusInSdp(localSdp)
-            if outboundAnswerSdp != localSdp {
-                log("answer.opusStereo.sdpUpdated mode=post-local-description")
-            }
+            let outboundAnswerSdp = connection.localDescription?.sdp ?? createdAnswer.sdp
             logCurrentAudioReceiverParameters(context: "answer.created")
             log("answer.created sdpLength=\(outboundAnswerSdp.count)")
             return outboundAnswerSdp
@@ -133,8 +143,16 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     func addRemoteIceCandidate(_ ice: IceMessage) async throws {
+        let rawCandidate = ice.candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !rawCandidate.isEmpty else {
+            log("webrtc.ice.remote.skip reason=empty-candidate")
+            return
+        }
+        remoteIceCandidateCount += 1
+        info("webrtc.ice.remote.received count=\(remoteIceCandidateCount) mid=\(ice.sdpMid ?? "nil") mline=\(ice.sdpMLineIndex ?? -1)")
+
         let candidate = RTCIceCandidate(
-            sdp: ice.candidate,
+            sdp: rawCandidate,
             sdpMLineIndex: Int32(ice.sdpMLineIndex ?? 0),
             sdpMid: ice.sdpMid
         )
@@ -217,6 +235,10 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         lastVideoInboundSnapshot = nil
         smoothedVideoFPS = nil
         lastReportedVideoSize = .zero
+        missingVideoInboundProbeCount = 0
+        hasLoggedVideoInbound = false
+        localIceCandidateCount = 0
+        remoteIceCandidateCount = 0
         pipController.updateDiagnosticsOverlay(nil)
 
         if let remoteVideoTrack {
@@ -249,9 +271,12 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         remoteVideoTrack = track
         track.isEnabled = true
         track.add(videoView)
+        pipController.setPiPContentReady(true)
+        pipController.requestStart()
         startStatsProbeIfNeeded()
         onStreamingChanged?(true)
 
+        info("pip.start.request reason=track-attached trackId=\(track.trackId)")
         log("track.attach kind=video trackId=\(track.trackId)")
     }
 
@@ -267,6 +292,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func handleConnectionStateChange(_ newState: RTCPeerConnectionState) {
+        info("webrtc.connectionState.changed value=\(newState.rawValue)")
         log("webrtc.connectionState=\(newState.rawValue)")
         if Self.terminalConnectionStates.contains(newState) {
             onStreamingChanged?(false)
@@ -278,6 +304,8 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         guard let tabId = currentTabId, let videoId = currentVideoId else {
             return
         }
+        localIceCandidateCount += 1
+        info("webrtc.ice.local.generated count=\(localIceCandidateCount) mid=\(candidate.sdpMid ?? "nil") mline=\(candidate.sdpMLineIndex)")
         let payload = LocalIceCandidate(
             tabId: tabId,
             videoId: videoId,
@@ -300,6 +328,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
     }
 
+
     private func setLocalDescription(_ description: RTCSessionDescription, on connection: RTCPeerConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.setLocalDescription(description) { error in
@@ -315,7 +344,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private func createAnswer(on connection: RTCPeerConnection) async throws -> RTCSessionDescription {
         let constraints = makeMediaConstraints()
 
-        return try await withCheckedThrowingContinuation { continuation in
+        let answer: RTCSessionDescription = try await withCheckedThrowingContinuation { continuation in
             connection.answer(for: constraints) { sdp, error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -328,6 +357,78 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
                 continuation.resume(returning: sdp)
             }
         }
+        
+        // Ensure answer SDP preserves high-quality Opus parameters from offer
+        let manipulatedSdp = preserveOpusQualityInAnswer(sdp: answer.sdp)
+        return RTCSessionDescription(type: .answer, sdp: manipulatedSdp)
+    }
+    
+    private func preserveOpusQualityInAnswer(sdp: String) -> String {
+        let lines = sdp.components(separatedBy: "\r\n")
+        var inAudioSection = false
+        var opusPayloadType: String?
+        
+        // Find Opus payload type
+        for line in lines {
+            if line.hasPrefix("a=rtpmap:") && line.lowercased().contains("opus/48000") {
+                if let match = line.range(of: #"^a=rtpmap:(\d+)"#, options: .regularExpression) {
+                    opusPayloadType = String(line[match].dropFirst("a=rtpmap:".count).split(separator: " ")[0])
+                    break
+                }
+            }
+        }
+        
+        guard let payloadType = opusPayloadType else {
+            return sdp
+        }
+        
+        var resultLines: [String] = []
+        var foundFmtp = false
+        
+        for i in 0..<lines.count {
+            let line = lines[i]
+            
+            if line.hasPrefix("m=audio") {
+                inAudioSection = true
+                resultLines.append(line)
+                // Add bandwidth constraints
+                let bandwidthKbps = Self.opusTargetBitrateBps / 1000
+                resultLines.append("b=AS:\(bandwidthKbps)")
+                resultLines.append("b=TIAS:\(Self.opusTargetBitrateBps)")
+                continue
+            } else if line.hasPrefix("m=") {
+                inAudioSection = false
+            }
+            
+            if inAudioSection && line.hasPrefix("a=fmtp:\(payloadType)") {
+                // Replace with high-quality parameters
+                let params = [
+                    "minptime=10",
+                    "useinbandfec=1",
+                    "stereo=1",
+                    "sprop-stereo=1",
+                    "maxaveragebitrate=\(Self.opusTargetBitrateBps)",
+                    "maxplaybackrate=48000",
+                ]
+                resultLines.append("a=fmtp:\(payloadType) \(params.joined(separator: ";"))")
+                foundFmtp = true
+                info("receiver.sdp.answer.fmtpReplaced payloadType=\(payloadType) bitrate=\(Self.opusTargetBitrateBps)")
+                continue
+            }
+            
+            // Skip existing bandwidth lines in audio section
+            if inAudioSection && (line.hasPrefix("b=AS:") || line.hasPrefix("b=TIAS:")) {
+                continue
+            }
+            
+            resultLines.append(line)
+        }
+        
+        if !foundFmtp && opusPayloadType != nil {
+            info("receiver.sdp.answer.warning fmtp not found in answer")
+        }
+        
+        return resultLines.joined(separator: "\r\n")
     }
 
     private func addIceCandidate(_ candidate: RTCIceCandidate, to connection: RTCPeerConnection) async throws {
@@ -351,59 +452,6 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             let candidate = pendingRemoteCandidates.removeFirst()
             try await addIceCandidate(candidate, to: connection)
         }
-    }
-
-    private func enforceStereoOpusInSdp(_ sdp: String) -> String {
-        if sdp.isEmpty {
-            return sdp
-        }
-
-        let lines = sdp.components(separatedBy: "\r\n")
-        var opusPayloadTypes = Set<String>()
-        for line in lines {
-            if let payload = opusPayloadType(fromRtpmapLine: line) {
-                opusPayloadTypes.insert(payload)
-            }
-        }
-        if opusPayloadTypes.isEmpty {
-            return sdp
-        }
-
-        var updatedAny = false
-        var transformed = lines.map { line -> String in
-            guard let payloadType = payloadType(fromFmtpLine: line), opusPayloadTypes.contains(payloadType) else {
-                return line
-            }
-            updatedAny = true
-            return upsertFmtpParameter(line: upsertFmtpParameter(line: line, key: "stereo", value: "1"), key: "sprop-stereo", value: "1")
-        }
-
-        if !updatedAny, let firstPayload = opusPayloadTypes.first {
-            for index in transformed.indices {
-                if transformed[index].lowercased() == "a=rtpmap:\(firstPayload) opus/48000/2".lowercased() {
-                    transformed.insert("a=fmtp:\(firstPayload) stereo=1;sprop-stereo=1", at: index + 1)
-                    break
-                }
-            }
-        }
-
-        return transformed.joined(separator: "\r\n")
-    }
-
-    private func opusPayloadType(fromRtpmapLine line: String) -> String? {
-        payloadType(in: line, using: Self.opusRtpmapRegex)
-    }
-
-    private func payloadType(fromFmtpLine line: String) -> String? {
-        payloadType(in: line, using: Self.fmtpPayloadRegex)
-    }
-
-    private func payloadType(in line: String, using regex: NSRegularExpression) -> String? {
-        let range = NSRange(location: 0, length: (line as NSString).length)
-        guard let match = regex.firstMatch(in: line, options: [], range: range), match.numberOfRanges > 1 else {
-            return nil
-        }
-        return (line as NSString).substring(with: match.range(at: 1))
     }
 
     private func makeMediaConstraints() -> RTCMediaConstraints {
@@ -431,29 +479,6 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         currentVideoId = nil
     }
 
-    private func upsertFmtpParameter(line: String, key: String, value: String) -> String {
-        guard let prefixEnd = line.firstIndex(of: " ") else {
-            return line
-        }
-        let prefix = String(line[..<line.index(after: prefixEnd)])
-        let rawValue = String(line[line.index(after: prefixEnd)...])
-
-        var segments = rawValue
-            .split(separator: ";")
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-
-        let target = "\(key)=\(value)"
-        let keyPrefix = "\(key)=".lowercased()
-        if let index = segments.firstIndex(where: { $0.lowercased().hasPrefix(keyPrefix) }) {
-            segments[index] = target
-        } else {
-            segments.append(target)
-        }
-
-        return "\(prefix)\(segments.joined(separator: ";"))"
-    }
-
     private func log(_ message: String) {
         guard debugLoggingEnabled else { return }
         print("[Float NativeRTC] \(message)")
@@ -470,7 +495,6 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func logCurrentAudioReceiverParameters(context: String) {
-        guard debugLoggingEnabled else { return }
         guard let connection = peerConnection else { return }
 
         let payload: [[String: Any]] = connection.receivers.compactMap { receiver in
@@ -500,7 +524,40 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
 
         if !payload.isEmpty {
-            log("receiver.audio.parameters context=\(context) payload=\(serializeForLog(payload))")
+            info("receiver.audio.parameters context=\(context) payload=\(serializeForLog(payload))")
+        }
+        
+        // Also log relevant SDP audio sections
+        if let remoteSdp = connection.remoteDescription?.sdp {
+            logAudioSdpSection(sdp: remoteSdp, label: "\(context).offer")
+        }
+        if let localSdp = connection.localDescription?.sdp {
+            logAudioSdpSection(sdp: localSdp, label: "\(context).answer")
+        }
+    }
+    
+    private func logAudioSdpSection(sdp: String, label: String) {
+        let lines = sdp.components(separatedBy: "\r\n")
+        var inAudioSection = false
+        var audioLines: [String] = []
+        
+        for line in lines {
+            if line.hasPrefix("m=audio") {
+                inAudioSection = true
+                audioLines.append(line)
+            } else if line.hasPrefix("m=") {
+                inAudioSection = false
+            } else if inAudioSection {
+                // Collect relevant audio lines
+                if line.hasPrefix("a=rtpmap:") || line.hasPrefix("a=fmtp:") || 
+                   line.hasPrefix("a=ptime:") || line.hasPrefix("a=maxptime:") {
+                    audioLines.append(line)
+                }
+            }
+        }
+        
+        if !audioLines.isEmpty {
+            info("receiver.audio.sdp label=\(label) lines=\(audioLines.joined(separator: " | "))")
         }
     }
 
@@ -529,9 +586,8 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 self.updateVideoDiagnosticsOverlay(using: report)
-                if self.debugLoggingEnabled {
-                    self.logReceiverAudioStats(report)
-                }
+                self.logTransportCandidatePairStats(report)
+                self.logReceiverAudioStats(report)
             }
         }
     }
@@ -558,13 +614,20 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
 
         guard let selectedStat else {
+            missingVideoInboundProbeCount += 1
+            if missingVideoInboundProbeCount == 1 || missingVideoInboundProbeCount % 5 == 0 {
+                info("receiver.stats.video.inbound-rtp.missing probes=\(missingVideoInboundProbeCount)")
+            }
             pipController.updateDiagnosticsOverlay(nil)
             return
         }
+        missingVideoInboundProbeCount = 0
 
         let values = selectedStat.values
         let reportedFPS = readDoubleStatValue(values["framesPerSecond"])
         let framesDecoded = readDoubleStatValue(values["framesDecoded"])
+        let bytesReceived = readDoubleStatValue(values["bytesReceived"])
+        let packetsReceived = readDoubleStatValue(values["packetsReceived"])
         let frameWidth = readIntStatValue(values["frameWidth"])
         let frameHeight = readIntStatValue(values["frameHeight"])
         let now = Date()
@@ -593,6 +656,20 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
                 "receiver.stats.video fps=\(fpsValue) width=\(widthValue) height=\(heightValue)"
             )
         }
+
+        if !hasLoggedVideoInbound {
+            hasLoggedVideoInbound = true
+            info("receiver.stats.video.inbound-rtp.detected")
+        }
+        let decodedValue = framesDecoded.map { String(format: "%.0f", $0) } ?? "null"
+        let bytesValue = bytesReceived.map { String(format: "%.0f", $0) } ?? "null"
+        let packetsValue = packetsReceived.map { String(format: "%.0f", $0) } ?? "null"
+        let fpsValue = resolvedFPS.map { String(format: "%.2f", $0) } ?? "null"
+        let widthValue = resolvedWidth.map(String.init) ?? "null"
+        let heightValue = resolvedHeight.map(String.init) ?? "null"
+        info(
+            "receiver.stats.video inbound decoded=\(decodedValue) bytes=\(bytesValue) packets=\(packetsValue) fps=\(fpsValue) width=\(widthValue) height=\(heightValue)"
+        )
     }
 
     private func resolveReceiverFPS(
@@ -660,8 +737,6 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func logReceiverAudioStats(_ report: RTCStatisticsReport) {
-        guard debugLoggingEnabled else { return }
-
         let codecById = report.statistics.reduce(into: [String: RTCStatistics]()) { result, pair in
             let stat = pair.value
             if stat.type == "codec" {
@@ -679,8 +754,24 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
 
             let codecId = values["codecId"] as? String
             let codecValues = codecId.flatMap { codecById[$0]?.values }
+            let bytesReceived = readDoubleStatValue(values["bytesReceived"])
+            
+            // Calculate bitrate
+            var bitrateKbps: Double?
+            let now = Date()
+            if let bytesReceived = bytesReceived,
+               let lastBytes = lastAudioBytesReceived,
+               let lastTime = lastAudioStatsTime {
+                let bytesDiff = bytesReceived - lastBytes
+                let timeDiff = now.timeIntervalSince(lastTime)
+                if timeDiff > 0 {
+                    bitrateKbps = (bytesDiff * 8) / (timeDiff * 1000) // Convert to kbps
+                }
+            }
+            lastAudioBytesReceived = bytesReceived
+            lastAudioStatsTime = now
 
-            entries.append([
+            var entry: [String: Any] = [
                 "id": stat.id,
                 "bytesReceived": values["bytesReceived"] ?? NSNull(),
                 "packetsReceived": values["packetsReceived"] ?? NSNull(),
@@ -691,20 +782,66 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
                 "codecId": codecId ?? NSNull(),
                 "codecMimeType": codecValues?["mimeType"] ?? NSNull(),
                 "codecChannels": codecValues?["channels"] ?? NSNull(),
+                "codecClockRate": codecValues?["clockRate"] ?? NSNull(),
                 "codecSdpFmtpLine": codecValues?["sdpFmtpLine"] ?? NSNull(),
-            ])
+            ]
+            
+            if let bitrateKbps = bitrateKbps {
+                entry["bitrateKbps"] = String(format: "%.1f", bitrateKbps)
+            }
+            
+            entries.append(entry)
         }
 
         if !entries.isEmpty {
-            log("receiver.stats.audio payload=\(serializeForLog(["reports": entries]))")
+            // Log first 10 times always, then only if debug enabled
+            audioStatsLogCount += 1
+            if audioStatsLogCount <= 10 || debugLoggingEnabled {
+                info("receiver.stats.audio count=\(audioStatsLogCount) payload=\(serializeForLog(["reports": entries]))")
+            }
         }
+    }
+
+    private func info(_ message: String) {
+        print("[Float NativeRTC] \(message)")
+    }
+
+    private func logTransportCandidatePairStats(_ report: RTCStatisticsReport) {
+        var selectedPair: RTCStatistics?
+        for (_, stat) in report.statistics where stat.type == "candidate-pair" {
+            let selected = stat.values["selected"] as? Bool
+            let nominated = stat.values["nominated"] as? Bool
+            let state = stat.values["state"] as? String
+            if selected == true || nominated == true || state == "succeeded" {
+                selectedPair = stat
+                break
+            }
+        }
+
+        guard let selectedPair else {
+            info("receiver.stats.transport candidatePair=missing")
+            return
+        }
+
+        let values = selectedPair.values
+        let state = values["state"] as? String ?? "unknown"
+        let nominated = (values["nominated"] as? Bool) == true
+        let selected = (values["selected"] as? Bool) == true
+        let writable = (values["writable"] as? Bool) == true
+        let readable = (values["readable"] as? Bool) == true
+        let bytesReceived = readDoubleStatValue(values["bytesReceived"]).map { String(format: "%.0f", $0) } ?? "null"
+        let bytesSent = readDoubleStatValue(values["bytesSent"]).map { String(format: "%.0f", $0) } ?? "null"
+        let currentRtt = readDoubleStatValue(values["currentRoundTripTime"]).map { String(format: "%.4f", $0) } ?? "null"
+        info("receiver.stats.transport state=\(state) selected=\(selected) nominated=\(nominated) writable=\(writable) readable=\(readable) bytesRx=\(bytesReceived) bytesTx=\(bytesSent) rtt=\(currentRtt)")
     }
 }
 
 extension NativeLibWebRTCReceiver: RTCPeerConnectionDelegate {
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
         _ = peerConnection
-        _ = stateChanged
+        Task { @MainActor [weak self] in
+            self?.info("webrtc.signalingState.changed value=\(stateChanged.rawValue)")
+        }
     }
 
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {
@@ -730,12 +867,16 @@ extension NativeLibWebRTCReceiver: RTCPeerConnectionDelegate {
 
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
         _ = peerConnection
-        _ = newState
+        Task { @MainActor [weak self] in
+            self?.info("webrtc.iceConnectionState.changed value=\(newState.rawValue)")
+        }
     }
 
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
         _ = peerConnection
-        _ = newState
+        Task { @MainActor [weak self] in
+            self?.info("webrtc.iceGatheringState.changed value=\(newState.rawValue)")
+        }
     }
 
     nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {

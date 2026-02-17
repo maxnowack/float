@@ -1,4 +1,5 @@
 declare const chrome: any;
+declare const browser: any;
 
 type FloatProtocolShape = {
   version: number;
@@ -65,4 +66,5 @@ declare var FloatProtocolError: (reason: string) => { type: "error"; reason: str
 
 interface HTMLMediaElement {
   captureStream(): MediaStream;
+  mozCaptureStream?(): MediaStream;
 }

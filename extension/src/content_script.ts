@@ -38,6 +38,7 @@ type AppliedVideoSenderSettings = {
   maxBitrateBps: number;
 };
 
+const contentScriptExt: any = (globalThis as any).chrome ?? (globalThis as any).browser;
 const videoMeta = new WeakMap<HTMLVideoElement, VideoMeta>();
 let videoCounter = 0;
 let scheduled = false;
@@ -49,22 +50,38 @@ let activeVideoSender: RTCRtpSender | null = null;
 let activeVideoSenderSettings: AppliedVideoSenderSettings | null = null;
 let activeVideoSenderUpdateInFlight = false;
 let activeVideoSenderNeedsReapply = false;
+let senderStatsTimer: number | null = null;
 let requestedVideoQualityHint: VideoQualityHint = {
   profile: "high",
   pipWidth: null,
   pipHeight: null,
 };
+let activeLocalIceCandidateCount = 0;
+let activeRemoteIceCandidateCount = 0;
 const qualityHintByVideoId = new Map<string, VideoQualityHint>();
 let didNotifyBackgroundSinceForeground = false;
+
+// ============================================================================
+// AUDIO QUALITY CONFIGURATION
+// ============================================================================
+// Target audio bitrate in bits per second (bps)
+// Recommended values:
+//   - 128000 (128 kbps): Good quality, lower bandwidth
+//   - 192000 (192 kbps): Very good quality, balanced
+//   - 256000 (256 kbps): Excellent quality (default)
+//   - 510000 (510 kbps): Maximum Opus quality
+const FLOAT_OPUS_BITRATE_BPS = 256_000;
+const FLOAT_OPUS_CHANNELS = 2; // Stereo audio
+// ============================================================================
+
 const FLOAT_MAX_VIDEO_FPS = 60;
-const FLOAT_AUDIO_MAX_BITRATE_BPS = 320_000;
+const FLOAT_AUDIO_MAX_BITRATE_BPS = 510_000;
 const FLOAT_VIDEO_MAX_SCALE_DOWN_BY = 8;
 const FLOAT_VIDEO_SCALE_CHANGE_EPSILON = 0.02;
 const FLOAT_VIDEO_MIN_BITRATE_BPS = 4_000_000;
 const FLOAT_VIDEO_MAX_BITRATE_BPS = 36_000_000;
 const FLOAT_VIDEO_TARGET_BITS_PER_PIXEL = 0.11;
-const FLOAT_VIDEO_CODEC_PRIORITY = ["video/H264", "video/VP8", "video/VP9", "video/AV1"] as const;
-const FLOAT_AUDIO_CODEC_PRIORITY = ["audio/opus", "audio/ISAC", "audio/G722", "audio/PCMU", "audio/PCMA"] as const;
+const isFirefox = typeof navigator.userAgent === "string" && /firefox/i.test(navigator.userAgent);
 const isTopFrame = (() => {
   try {
     return window.top === window;
@@ -73,6 +90,161 @@ const isTopFrame = (() => {
   }
 })();
 
+/**
+ * Modifies SDP to force Opus codec with specified bitrate and channel count.
+ * Removes all other audio codecs and sets Opus parameters.
+ */
+function forceOpusCodec(sdp: string): string {
+  const lines = sdp.split('\r\n');
+  const outputLines: string[] = [];
+  let opusPayloadType: string | null = null;
+
+  // First pass: find Opus payload type
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    
+    // Find Opus payload type
+    if (line.toLowerCase().includes('rtpmap') && line.toLowerCase().includes('opus/48000')) {
+      const match = line.match(/^a=rtpmap:(\d+)\s+opus\/48000\/2/i);
+      if (match) {
+        opusPayloadType = match[1];
+        debugLog("forceOpusCodec.found", { payloadType: opusPayloadType });
+        break;
+      }
+    }
+  }
+
+  if (!opusPayloadType) {
+    // Opus not found, return original SDP
+    debugLog("forceOpusCodec.notFound", { warning: "Opus codec not found in SDP" });
+    return sdp;
+  }
+
+  // Second pass: rebuild SDP with only Opus codec
+  let inAudioSection = false;
+  let foundFmtpForOpus = false;
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Track when we're in audio media section
+    if (line.startsWith('m=audio')) {
+      inAudioSection = true;
+      // Replace m=audio line to include only Opus payload type
+      const parts = line.split(' ');
+      if (parts.length >= 4) {
+        outputLines.push(`${parts[0]} ${parts[1]} ${parts[2]} ${opusPayloadType}`);
+      } else {
+        outputLines.push(line);
+      }
+      // Add bandwidth constraint right after m=audio line
+      outputLines.push(`b=AS:${Math.ceil(FLOAT_OPUS_BITRATE_BPS / 1000)}`); // AS bandwidth in kbps
+      outputLines.push(`b=TIAS:${FLOAT_OPUS_BITRATE_BPS}`); // TIAS bandwidth in bps
+      debugLog("forceOpusCodec.bandwidth", {
+        AS: Math.ceil(FLOAT_OPUS_BITRATE_BPS / 1000),
+        TIAS: FLOAT_OPUS_BITRATE_BPS,
+      });
+      continue;
+    } else if (line.startsWith('m=')) {
+      // Before leaving audio section, ensure we have fmtp
+      if (inAudioSection && !foundFmtpForOpus) {
+        const params = [
+          'minptime=10',
+          'useinbandfec=1',
+          'stereo=1',
+          'sprop-stereo=1',
+          `maxaveragebitrate=${FLOAT_OPUS_BITRATE_BPS}`,
+          'maxplaybackrate=48000',
+        ];
+        const fmtpLine = `a=fmtp:${opusPayloadType} ${params.join(';')}`;
+        outputLines.push(fmtpLine);
+        debugLog("forceOpusCodec.fmtpAdded", { fmtpLine });
+      }
+      inAudioSection = false;
+    }
+
+    if (!inAudioSection) {
+      outputLines.push(line);
+      continue;
+    }
+
+    // In audio section: filter codec-related attributes
+    if (line.startsWith('a=rtpmap:')) {
+      // Only keep Opus rtpmap
+      if (line.includes(`a=rtpmap:${opusPayloadType}`)) {
+        outputLines.push(line);
+        // Add ptime right after rtpmap
+        outputLines.push('a=ptime:20');
+        outputLines.push('a=maxptime:120');
+      }
+      continue;
+    }
+
+    if (line.startsWith('a=rtcp-fb:')) {
+      // Only keep rtcp-fb for Opus
+      if (line.startsWith(`a=rtcp-fb:${opusPayloadType}`)) {
+        outputLines.push(line);
+      }
+      continue;
+    }
+
+    if (line.startsWith('a=fmtp:')) {
+      // Only keep fmtp for Opus and add our parameters
+      if (line.startsWith(`a=fmtp:${opusPayloadType}`)) {
+        // Force Opus parameters: stereo, high bitrate for quality
+        const params = [
+          'minptime=10',
+          'useinbandfec=1',
+          'stereo=1',
+          'sprop-stereo=1',
+          `maxaveragebitrate=${FLOAT_OPUS_BITRATE_BPS}`,
+          'maxplaybackrate=48000',
+        ];
+        const fmtpLine = `a=fmtp:${opusPayloadType} ${params.join(';')}`;
+        outputLines.push(fmtpLine);
+        debugLog("forceOpusCodec.fmtpReplaced", { fmtpLine });
+        foundFmtpForOpus = true;
+      }
+      continue;
+    }
+
+    if (line.startsWith('a=ptime:') || line.startsWith('a=maxptime:')) {
+      // Skip existing ptime, we add it after rtpmap
+      continue;
+    }
+
+    if (line.startsWith('b=AS:') || line.startsWith('b=TIAS:')) {
+      // Skip existing bandwidth lines, we add our own
+      continue;
+    }
+
+    // Keep all other audio section attributes
+    outputLines.push(line);
+  }
+
+  const result = outputLines.join('\r\n');
+  
+  // Extract and log just the audio media section
+  const audioSection: string[] = [];
+  let inAudio = false;
+  for (const line of result.split('\r\n')) {
+    if (line.startsWith('m=audio')) {
+      inAudio = true;
+      audioSection.push(line);
+    } else if (line.startsWith('m=')) {
+      inAudio = false;
+    } else if (inAudio) {
+      audioSection.push(line);
+    }
+  }
+  
+  debugLog("forceOpusCodec.complete", {
+    audioSectionLines: audioSection.length,
+    audioSection: audioSection.slice(0, 15),
+  });
+  return result;
+}
+
 function debugLog(event: string, payload?: Record<string, unknown>): void {
   if (typeof payload === "undefined") {
     console.log(`[Float CS] ${event}`);
@@ -80,7 +252,7 @@ function debugLog(event: string, payload?: Record<string, unknown>): void {
     console.log(`[Float CS] ${event}`, payload);
   }
 
-  chrome.runtime.sendMessage({
+  contentScriptExt.runtime.sendMessage({
     type: "float:debug",
     source: "content-script",
     event,
@@ -253,7 +425,7 @@ function emitState(): void {
     videos: collectCandidates(),
   };
 
-  chrome.runtime.sendMessage(payload);
+  contentScriptExt.runtime.sendMessage(payload);
 }
 
 function notifyTabBackgrounded(trigger: string): void {
@@ -262,7 +434,7 @@ function notifyTabBackgrounded(trigger: string): void {
   }
 
   didNotifyBackgroundSinceForeground = true;
-  chrome.runtime.sendMessage({
+  contentScriptExt.runtime.sendMessage({
     type: "float:tab:background",
     trigger,
     page: {
@@ -280,7 +452,7 @@ function notifyTabForegrounded(trigger: string): void {
   }
 
   didNotifyBackgroundSinceForeground = false;
-  chrome.runtime.sendMessage({
+  contentScriptExt.runtime.sendMessage({
     type: "float:tab:foreground",
     trigger,
     page: {
@@ -381,7 +553,7 @@ if (isTopFrame) {
 }
 window.addEventListener("beforeunload", () => {
   stopStreaming();
-  chrome.runtime.sendMessage({
+  contentScriptExt.runtime.sendMessage({
     type: "float:videos:clear",
   });
 });
@@ -421,17 +593,11 @@ function findBestAvailableVideo(): HTMLVideoElement | null {
 }
 
 function notifyWebRTCError(reason: string): void {
-  chrome.runtime.sendMessage({
+  contentScriptExt.runtime.sendMessage({
     type: "float:webrtc:error",
     reason,
     videoId: activeVideoId,
   });
-}
-
-function codecPriorityIndex(mimeType: string, preferredCodecs: readonly string[]): number {
-  const normalizedMimeType = mimeType.toLowerCase();
-  const index = preferredCodecs.findIndex((codec) => codec.toLowerCase() === normalizedMimeType);
-  return index === -1 ? preferredCodecs.length : index;
 }
 
 function computeScaleResolutionDownBy(
@@ -498,105 +664,27 @@ function computeVideoSenderSettings(
   };
 }
 
-function appendSdpFmtpParameter(line: string, key: string, value: string): string {
-  const prefixEnd = line.indexOf(" ");
-  if (prefixEnd < 0) {
-    return line;
+function describeUnknownError(error: unknown): string {
+  if (error instanceof Error) {
+    return `${error.name}: ${error.message}`;
   }
-  const prefix = line.slice(0, prefixEnd + 1);
-  const rawValue = line.slice(prefixEnd + 1);
-  const segments = rawValue
-    .split(";")
-    .map((segment) => segment.trim())
-    .filter((segment) => segment.length > 0);
-  const target = `${key}=${value}`;
-  const keyPrefix = `${key}=`;
-  const existingIndex = segments.findIndex((segment) => segment.toLowerCase().startsWith(keyPrefix.toLowerCase()));
-  if (existingIndex >= 0) {
-    segments[existingIndex] = target;
-  } else {
-    segments.push(target);
+  if (typeof error === "string") {
+    return error;
   }
-  return `${prefix}${segments.join(";")}`;
-}
-
-function enforceStereoOpusInOfferSdp(offerSdp: string, selectedVideoId: string): string {
-  const lines = offerSdp.split("\r\n");
-  const opusPayloadTypes = new Set<string>();
-
-  lines.forEach((line) => {
-    const match = /^a=rtpmap:(\d+)\s+opus\/48000\/2$/i.exec(line);
-    if (match?.[1]) {
-      opusPayloadTypes.add(match[1]);
+  if (error && typeof error === "object") {
+    const candidate = error as Record<string, unknown>;
+    const name = typeof candidate.name === "string" ? candidate.name : "Error";
+    const message = typeof candidate.message === "string" ? candidate.message : null;
+    if (message && message.length > 0) {
+      return `${name}: ${message}`;
     }
-  });
-
-  if (opusPayloadTypes.size === 0) {
-    return offerSdp;
+    const ownKeys = Object.keys(candidate);
+    if (ownKeys.length > 0) {
+      return JSON.stringify(candidate, ownKeys);
+    }
+    return "{}";
   }
-
-  let updated = false;
-  const transformed = lines.map((line) => {
-    const match = /^a=fmtp:(\d+)\s+/i.exec(line);
-    if (!match?.[1] || !opusPayloadTypes.has(match[1])) {
-      return line;
-    }
-    updated = true;
-    let next = appendSdpFmtpParameter(line, "stereo", "1");
-    next = appendSdpFmtpParameter(next, "sprop-stereo", "1");
-    return next;
-  });
-
-  if (!updated) {
-    const mutable = [...transformed];
-    const opusPayloadType = Array.from(opusPayloadTypes)[0];
-    for (let index = 0; index < mutable.length; index += 1) {
-      const line = mutable[index];
-      if (new RegExp(`^a=rtpmap:${opusPayloadType}\\s+opus/48000/2$`, "i").test(line)) {
-        mutable.splice(index + 1, 0, `a=fmtp:${opusPayloadType} stereo=1;sprop-stereo=1`);
-        updated = true;
-        break;
-      }
-    }
-    if (updated) {
-      debugLog("sender.opusStereo.sdpUpdated", {
-        selectedVideoId,
-        mode: "inserted-fmtp",
-      });
-      return mutable.join("\r\n");
-    }
-  }
-
-  if (updated) {
-    debugLog("sender.opusStereo.sdpUpdated", {
-      selectedVideoId,
-      mode: "updated-fmtp",
-    });
-  }
-
-  return transformed.join("\r\n");
-}
-
-function extractOpusFmtpLinesFromSdp(sdp: string): string[] {
-  const lines = sdp.split("\r\n");
-  const opusPayloadTypes = new Set<string>();
-  lines.forEach((line) => {
-    const match = /^a=rtpmap:(\d+)\s+opus\/48000\/2$/i.exec(line);
-    if (match?.[1]) {
-      opusPayloadTypes.add(match[1]);
-    }
-  });
-
-  const opusFmtpLines: string[] = [];
-  lines.forEach((line) => {
-    const match = /^a=fmtp:(\d+)\s+/i.exec(line);
-    if (!match?.[1] || !opusPayloadTypes.has(match[1])) {
-      return;
-    }
-    opusFmtpLines.push(line);
-  });
-
-  return opusFmtpLines;
+  return String(error);
 }
 
 function logAudioTrackDiagnostics(selectedVideoId: string, audioTracks: MediaStreamTrack[]): void {
@@ -723,44 +811,6 @@ function applyVideoQualityHint(videoId: string, hint: VideoQualityHint): void {
   scheduleActiveVideoSenderQualityUpdate(videoId, "pip-quality-hint");
 }
 
-function applyCodecPreferences(
-  peer: RTCPeerConnection,
-  sender: RTCRtpSender,
-  selectedVideoId: string,
-): void {
-  const kind = sender.track?.kind;
-  if (kind !== "audio" && kind !== "video") {
-    return;
-  }
-
-  const transceiver = peer.getTransceivers().find((candidate) => candidate.sender === sender);
-  if (!transceiver || typeof transceiver.setCodecPreferences !== "function") {
-    return;
-  }
-
-  const capabilities = RTCRtpSender.getCapabilities?.(kind);
-  const codecs = capabilities?.codecs;
-  if (!codecs || codecs.length === 0) {
-    return;
-  }
-
-  const preferredCodecs = kind === "video" ? FLOAT_VIDEO_CODEC_PRIORITY : FLOAT_AUDIO_CODEC_PRIORITY;
-  const sortedCodecs = [...codecs].sort((left, right) => {
-    return codecPriorityIndex(left.mimeType, preferredCodecs) - codecPriorityIndex(right.mimeType, preferredCodecs);
-  });
-
-  try {
-    transceiver.setCodecPreferences(sortedCodecs);
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "setCodecPreferences failed";
-    debugLog("sender.codecPreferences.failed", {
-      selectedVideoId,
-      kind,
-      reason,
-    });
-  }
-}
-
 async function applyTrackQualitySettings(
   selectedVideoId: string,
   videoTrack: MediaStreamTrack,
@@ -772,15 +822,31 @@ async function applyTrackQualitySettings(
     // Ignore unsupported contentHint.
   }
 
-  try {
-    await videoTrack.applyConstraints({
-      frameRate: { ideal: FLOAT_MAX_VIDEO_FPS, max: FLOAT_MAX_VIDEO_FPS },
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "video applyConstraints failed";
-    debugLog("source.track.videoConstraints.failed", {
+  if (!isFirefox) {
+    const videoCapabilities =
+      typeof (videoTrack as any).getCapabilities === "function"
+        ? (videoTrack as any).getCapabilities()
+        : null;
+    const videoConstraints: MediaTrackConstraints = {};
+    if (videoCapabilities && "frameRate" in videoCapabilities) {
+      videoConstraints.frameRate = { ideal: FLOAT_MAX_VIDEO_FPS, max: FLOAT_MAX_VIDEO_FPS };
+    }
+
+    if (Object.keys(videoConstraints).length > 0) {
+      try {
+        await videoTrack.applyConstraints(videoConstraints);
+      } catch (error) {
+        const reason = error instanceof Error ? error.message : "video applyConstraints failed";
+        debugLog("source.track.videoConstraints.failed", {
+          selectedVideoId,
+          reason,
+        });
+      }
+    }
+  } else {
+    debugLog("source.track.videoConstraints.skipped", {
       selectedVideoId,
-      reason,
+      reason: "firefox-video-compatibility",
     });
   }
 
@@ -795,20 +861,40 @@ async function applyTrackQualitySettings(
     // Ignore unsupported contentHint.
   }
 
-  try {
-    await primaryAudioTrack.applyConstraints({
-      autoGainControl: false,
-      echoCancellation: false,
-      noiseSuppression: false,
-      channelCount: { ideal: 2 },
-      sampleRate: { ideal: 48000 },
-    });
-  } catch (error) {
-    const reason = error instanceof Error ? error.message : "audio applyConstraints failed";
-    debugLog("source.track.audioConstraints.failed", {
-      selectedVideoId,
-      reason,
-    });
+  const audioCapabilities =
+    typeof (primaryAudioTrack as any).getCapabilities === "function"
+      ? (primaryAudioTrack as any).getCapabilities()
+      : null;
+  const audioConstraints: MediaTrackConstraints = {};
+  if (audioCapabilities && "autoGainControl" in audioCapabilities) {
+    audioConstraints.autoGainControl = false;
+  }
+  if (audioCapabilities && "echoCancellation" in audioCapabilities) {
+    audioConstraints.echoCancellation = false;
+  }
+  if (audioCapabilities && "noiseSuppression" in audioCapabilities) {
+    audioConstraints.noiseSuppression = false;
+  }
+  if (audioCapabilities && "channelCount" in audioCapabilities) {
+    audioConstraints.channelCount = { ideal: 2 };
+  }
+  if (audioCapabilities && "sampleRate" in audioCapabilities) {
+    audioConstraints.sampleRate = { ideal: 48000 };
+  }
+  if (audioCapabilities && "sampleSize" in audioCapabilities) {
+    audioConstraints.sampleSize = { ideal: 16 };
+  }
+
+  if (Object.keys(audioConstraints).length > 0) {
+    try {
+      await primaryAudioTrack.applyConstraints(audioConstraints);
+    } catch (error) {
+      const reason = error instanceof Error ? error.message : "audio applyConstraints failed";
+      debugLog("source.track.audioConstraints.failed", {
+        selectedVideoId,
+        reason,
+      });
+    }
   }
 
   logAudioTrackDiagnostics(selectedVideoId, audioTracks);
@@ -822,6 +908,14 @@ async function applySenderQualitySettings(
 ): Promise<AppliedVideoSenderSettings | null> {
   const kind = sender.track?.kind;
   if (kind !== "audio" && kind !== "video") {
+    return null;
+  }
+
+  if (kind === "video" && isFirefox) {
+    debugLog("sender.parameters.video.skipped", {
+      selectedVideoId,
+      reason: "firefox-video-compatibility",
+    });
     return null;
   }
 
@@ -841,9 +935,8 @@ async function applySenderQualitySettings(
     primaryEncoding.maxFramerate = FLOAT_MAX_VIDEO_FPS;
     primaryEncoding.scaleResolutionDownBy = appliedVideoSettings.scaleDownBy;
     parameters.degradationPreference = "maintain-framerate";
-  } else {
-    primaryEncoding.maxBitrate = FLOAT_AUDIO_MAX_BITRATE_BPS;
   }
+  // Note: Removed maxBitrate for audio to avoid limiting quality
 
   encodings[0] = primaryEncoding;
   parameters.encodings = encodings;
@@ -875,6 +968,12 @@ function stopStreaming(): void {
   activeVideoSenderUpdateInFlight = false;
   activeVideoSenderSettings = null;
   activeVideoSender = null;
+  activeLocalIceCandidateCount = 0;
+  activeRemoteIceCandidateCount = 0;
+  if (senderStatsTimer !== null) {
+    clearInterval(senderStatsTimer);
+    senderStatsTimer = null;
+  }
 
   if (activePeer) {
     activePeer.onicecandidate = null;
@@ -890,13 +989,23 @@ function stopStreaming(): void {
 
   if (activeVideoId) {
     qualityHintByVideoId.delete(activeVideoId);
-    chrome.runtime.sendMessage({
+    contentScriptExt.runtime.sendMessage({
       type: "float:webrtc:stopped",
       videoId: activeVideoId,
     });
   }
   activeSourceVideo = null;
   activeVideoId = null;
+}
+
+function captureVideoStream(video: HTMLVideoElement): MediaStream {
+  if (typeof video.captureStream === "function") {
+    return video.captureStream();
+  }
+  if (typeof video.mozCaptureStream === "function") {
+    return video.mozCaptureStream();
+  }
+  throw new Error("captureStream is unavailable in this browser");
 }
 
 async function startStreaming(videoId: string): Promise<void> {
@@ -934,7 +1043,7 @@ async function startStreaming(videoId: string): Promise<void> {
 
   let stream: MediaStream;
   try {
-    stream = video.captureStream();
+    stream = captureVideoStream(video);
   } catch (error) {
     const reason = error instanceof Error ? error.message : "captureStream failed";
     notifyWebRTCError(reason);
@@ -968,17 +1077,51 @@ async function startStreaming(videoId: string): Promise<void> {
   const peer = new RTCPeerConnection({
     iceServers: [],
   });
+  if (senderStatsTimer !== null) {
+    clearInterval(senderStatsTimer);
+    senderStatsTimer = null;
+  }
 
   const senders: RTCRtpSender[] = [];
+  const transceivers: RTCRtpTransceiver[] = [];
   stream.getTracks().forEach((track) => {
     track.enabled = true;
     const sender = peer.addTrack(track, stream);
     senders.push(sender);
+    
+    // Get the transceiver for this sender
+    const transceiver = peer.getTransceivers().find(t => t.sender === sender);
+    if (transceiver) {
+      transceivers.push(transceiver);
+      
+      // For audio transceivers, set codec preferences to force Opus with high bitrate
+      if (track.kind === "audio" && typeof transceiver.setCodecPreferences === "function") {
+        try {
+          const capabilities = RTCRtpSender.getCapabilities("audio");
+          if (capabilities && capabilities.codecs) {
+            // Find Opus codec and prefer it
+            const opusCodecs = capabilities.codecs.filter(codec => 
+              codec.mimeType.toLowerCase() === "audio/opus"
+            );
+            if (opusCodecs.length > 0) {
+              // Set Opus as the only codec
+              transceiver.setCodecPreferences(opusCodecs);
+              debugLog("sender.codec.preferences.set", {
+                selectedVideoId,
+                codecCount: opusCodecs.length,
+              });
+            }
+          }
+        } catch (error) {
+          debugLog("sender.codec.preferences.failed", {
+            selectedVideoId,
+            reason: error instanceof Error ? error.message : "setCodecPreferences failed",
+          });
+        }
+      }
+    }
   });
 
-  senders.forEach((sender) => {
-    applyCodecPreferences(peer, sender, selectedVideoId);
-  });
   let initialVideoSettings: AppliedVideoSenderSettings | null = null;
   await Promise.all(
     senders.map(async (sender) => {
@@ -993,19 +1136,42 @@ async function startStreaming(videoId: string): Promise<void> {
 
   peer.onicecandidate = (event) => {
     if (!event.candidate) {
+      debugLog("sender.ice.local.completed", {
+        selectedVideoId,
+        localCandidateCount: activeLocalIceCandidateCount,
+      });
       return;
     }
+    const candidate = typeof event.candidate.candidate === "string"
+      ? event.candidate.candidate.trim()
+      : "";
+    if (candidate.length === 0) {
+      return;
+    }
+    activeLocalIceCandidateCount += 1;
+    debugLog("sender.ice.local", {
+      selectedVideoId,
+      localCandidateCount: activeLocalIceCandidateCount,
+      sdpMid: event.candidate.sdpMid ?? null,
+      sdpMLineIndex: event.candidate.sdpMLineIndex ?? null,
+      protocol: event.candidate.protocol ?? null,
+      candidateType: event.candidate.type ?? null,
+    });
 
-    chrome.runtime.sendMessage({
+    contentScriptExt.runtime.sendMessage({
       type: "float:webrtc:ice",
       videoId: selectedVideoId,
-      candidate: event.candidate.candidate,
+      candidate,
       sdpMid: event.candidate.sdpMid,
       sdpMLineIndex: event.candidate.sdpMLineIndex,
     });
   };
 
   peer.onconnectionstatechange = () => {
+    debugLog("sender.connectionState.changed", {
+      selectedVideoId,
+      connectionState: peer.connectionState,
+    });
     if (peer.connectionState === "disconnected") {
       stopStreaming();
       return;
@@ -1015,30 +1181,62 @@ async function startStreaming(videoId: string): Promise<void> {
     }
   };
 
+  peer.oniceconnectionstatechange = () => {
+    debugLog("sender.iceConnectionState.changed", {
+      selectedVideoId,
+      iceConnectionState: peer.iceConnectionState,
+    });
+  };
+
+  peer.onicegatheringstatechange = () => {
+    debugLog("sender.iceGatheringState.changed", {
+      selectedVideoId,
+      iceGatheringState: peer.iceGatheringState,
+    });
+  };
+
   try {
     const offer = await peer.createOffer();
     const rawOfferSdp = offer.sdp;
     if (typeof rawOfferSdp !== "string" || rawOfferSdp.length === 0) {
       throw new Error("offer SDP is missing");
     }
-    const offerOpusFmtpBefore = extractOpusFmtpLinesFromSdp(rawOfferSdp);
-    const stereoOfferSdp = enforceStereoOpusInOfferSdp(rawOfferSdp, selectedVideoId);
-    const offerOpusFmtpAfter = extractOpusFmtpLinesFromSdp(stereoOfferSdp);
-    debugLog("sender.offer.audioSdp", {
+    // Force Opus codec with high bitrate and 2 channels
+    debugLog("sender.offer.sdp.original", {
       selectedVideoId,
-      before: offerOpusFmtpBefore,
-      after: offerOpusFmtpAfter,
+      sdpLength: rawOfferSdp.length,
+      hasAudio: rawOfferSdp.includes('m=audio'),
+      hasOpus: rawOfferSdp.toLowerCase().includes('opus'),
     });
+    
+    const offerSdp = forceOpusCodec(rawOfferSdp);
+    
+    // Log audio section of SDP to verify our manipulation worked
+    const sdpLines = offerSdp.split('\r\n');
+    const audioSection: string[] = [];
+    let inAudioSection = false;
+    for (const line of sdpLines) {
+      if (line.startsWith('m=audio')) {
+        inAudioSection = true;
+        audioSection.push(line);
+      } else if (line.startsWith('m=')) {
+        if (inAudioSection) break; // Stop at next media section
+        inAudioSection = false;
+      } else if (inAudioSection) {
+        audioSection.push(line);
+      }
+    }
+    debugLog("sender.offer.sdp.audio", {
+      selectedVideoId,
+      audioSection: audioSection.slice(0, 20), // First 20 lines of audio section
+    });
+    
     await peer.setLocalDescription({
       type: "offer",
-      sdp: stereoOfferSdp,
+      sdp: offerSdp,
     });
 
-    const localOfferSdp = peer.localDescription?.sdp ?? stereoOfferSdp;
-    debugLog("sender.offer.audioSdp.localDescription", {
-      selectedVideoId,
-      opusFmtp: extractOpusFmtpLinesFromSdp(localOfferSdp),
-    });
+    const localOfferSdp = peer.localDescription?.sdp ?? offerSdp;
     activePeer = peer;
     activeStream = stream;
     activeVideoId = selectedVideoId;
@@ -1054,8 +1252,43 @@ async function startStreaming(videoId: string): Promise<void> {
     if (activeVideoSender) {
       scheduleActiveVideoSenderQualityUpdate(selectedVideoId, "stream-start");
     }
+    if (!isFirefox) {
+      senderStatsTimer = window.setInterval(() => {
+        if (!activePeer || activeVideoId !== selectedVideoId) {
+          return;
+        }
+        void activePeer
+          .getStats()
+          .then((report) => {
+            report.forEach((stat) => {
+              if (stat.type !== "outbound-rtp") {
+                return;
+              }
+              const kind = (stat as any).kind ?? (stat as any).mediaType ?? null;
+              if (kind !== "video") {
+                return;
+              }
+              debugLog("sender.stats.video.outbound", {
+                selectedVideoId,
+                bytesSent: (stat as any).bytesSent ?? null,
+                packetsSent: (stat as any).packetsSent ?? null,
+                framesEncoded: (stat as any).framesEncoded ?? null,
+                frameWidth: (stat as any).frameWidth ?? null,
+                frameHeight: (stat as any).frameHeight ?? null,
+              });
+            });
+          })
+          .catch((error) => {
+            const reason = describeUnknownError(error);
+            debugLog("sender.stats.failed", {
+              selectedVideoId,
+              reason,
+            });
+          });
+      }, 1000);
+    }
 
-    chrome.runtime.sendMessage({
+    contentScriptExt.runtime.sendMessage({
       type: "float:webrtc:offer",
       videoId: selectedVideoId,
       sdp: localOfferSdp,
@@ -1135,19 +1368,10 @@ async function applyAnswer(videoId: string, sdp: string): Promise<void> {
     return;
   }
 
-  const answerOpusFmtpBefore = extractOpusFmtpLinesFromSdp(sdp);
-  const stereoAnswerSdp = enforceStereoOpusInOfferSdp(sdp, videoId);
-  const answerOpusFmtpAfter = extractOpusFmtpLinesFromSdp(stereoAnswerSdp);
-
-  debugLog("sender.answer.audioSdp", {
-    videoId,
-    before: answerOpusFmtpBefore,
-    after: answerOpusFmtpAfter,
-  });
-
+  const answerSdp = sdp;
   await activePeer.setRemoteDescription({
     type: "answer",
-    sdp: stereoAnswerSdp,
+    sdp: answerSdp,
   });
 }
 
@@ -1161,6 +1385,14 @@ async function addIceCandidate(
     return;
   }
 
+  activeRemoteIceCandidateCount += 1;
+  debugLog("sender.ice.remote", {
+    videoId,
+    remoteCandidateCount: activeRemoteIceCandidateCount,
+    sdpMid,
+    sdpMLineIndex,
+  });
+
   await activePeer.addIceCandidate(
     new RTCIceCandidate({
       candidate,
@@ -1170,7 +1402,7 @@ async function addIceCandidate(
   );
 }
 
-chrome.runtime.onMessage.addListener((message: any) => {
+contentScriptExt.runtime.onMessage.addListener((message: any) => {
   if (!message || typeof message.type !== "string") {
     return;
   }

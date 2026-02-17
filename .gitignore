@@ -1,6 +1,6 @@
 # Chrome
 node_modules
-chrome/dist
+extension/dist
 
 # macOS
 .DS_Store

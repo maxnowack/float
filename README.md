@@ -1,14 +1,14 @@
 # Float
 
 <p align="center">
-  <img src="./chrome/icons/icon128.png" alt="Float icon" width="96" height="96" />
+  <img src="./extension/icons/icon128.png" alt="Float icon" width="96" height="96" />
 </p>
 
 <p align="center">
-  Native macOS Picture-in-Picture for Chrome.
+  Native macOS Picture-in-Picture for browser video.
 </p>
 
-Float exists for one reason: Chrome PiP is not native macOS PiP.
+Float exists for one reason: browser PiP is not native macOS PiP.
 Float brings browser video into real system PiP so it works better with Spaces and fullscreen apps.
 
 ## Download
@@ -20,7 +20,7 @@ Download the latest release from:
 ## Usage
 
 1. Install and open the Float companion app.
-2. Install/load the Float Chrome extension.
+2. Install/load the Float browser extension (Chrome or Firefox).
 3. Open a page with a video.
 4. Click the Float menu bar icon and pick a source.
 
@@ -28,9 +28,11 @@ Download the latest release from:
 
 Float is split into:
 
-- `chrome/` (extension sender)
+- `extension/` (shared extension source + manifests)
 - `companion/` (macOS receiver + native PiP)
 - `scripts/` (build/pack/release helpers)
+
+The extension code is shared with two explicit manifests: one for Chrome and one for Firefox.
 
 Basic commands:
 
@@ -38,6 +40,22 @@ Basic commands:
 ./scripts/build-all.sh Release
 ./scripts/pack-all.sh Release
 ./scripts/release.sh --tag v0.2.0
+```
+
+Extension-only commands:
+
+```bash
+./scripts/build-chrome.sh
+./scripts/build-firefox.sh
+./scripts/pack-chrome.sh
+./scripts/pack-firefox.sh
+```
+
+From `extension/`, you can also run:
+
+```bash
+yarn build:chrome
+yarn build:firefox
 ```
 
 Notes:
