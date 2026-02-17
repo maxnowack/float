@@ -152,14 +152,14 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         launchAtLoginItem.state = signalingServer.launchAtLoginEnabled ? .on : .off
         menu.addItem(launchAtLoginItem)
 
-        let fpsOverlayItem = NSMenuItem(
-            title: "FPS Overlay",
-            action: #selector(handleFPSOverlayToggled(_:)),
+        let debugOverlayItem = NSMenuItem(
+            title: "Debug Overlay",
+            action: #selector(handleDebugOverlayToggled(_:)),
             keyEquivalent: ""
         )
-        fpsOverlayItem.target = self
-        fpsOverlayItem.state = signalingServer.diagnosticsOverlayEnabled ? .on : .off
-        menu.addItem(fpsOverlayItem)
+        debugOverlayItem.target = self
+        debugOverlayItem.state = signalingServer.diagnosticsOverlayEnabled ? .on : .off
+        menu.addItem(debugOverlayItem)
 
         menu.addItem(.separator())
 
@@ -206,7 +206,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         sender.state = signalingServer.launchAtLoginEnabled ? .on : .off
     }
 
-    @objc private func handleFPSOverlayToggled(_ sender: NSMenuItem) {
+    @objc private func handleDebugOverlayToggled(_ sender: NSMenuItem) {
         let enabled = sender.state != .on
         signalingServer.setDiagnosticsOverlayEnabled(enabled)
         sender.state = enabled ? .on : .off

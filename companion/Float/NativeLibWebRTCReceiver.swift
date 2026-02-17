@@ -65,6 +65,9 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private var lastAudioBytesReceived: Double?
     private var lastAudioStatsTime: Date?
     private var audioStatsLogCount = 0
+    private var lastVideoBytesReceived: Double?
+    private var lastVideoStatsTime: Date?
+    private var currentConnectionState: RTCPeerConnectionState?
 
     override init() {
         if !Self.didInitializeFieldTrials {
@@ -239,6 +242,9 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         hasLoggedVideoInbound = false
         localIceCandidateCount = 0
         remoteIceCandidateCount = 0
+        lastVideoBytesReceived = nil
+        lastVideoStatsTime = nil
+        currentConnectionState = nil
         pipController.updateDiagnosticsOverlay(nil)
 
         if let remoteVideoTrack {
@@ -292,6 +298,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func handleConnectionStateChange(_ newState: RTCPeerConnectionState) {
+        currentConnectionState = newState
         info("webrtc.connectionState.changed value=\(newState.rawValue)")
         log("webrtc.connectionState=\(newState.rawValue)")
         if Self.terminalConnectionStates.contains(newState) {
@@ -640,12 +647,70 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         let resolvedWidth = frameWidth ?? fallbackVideoDimension(lastReportedVideoSize.width)
         let resolvedHeight = frameHeight ?? fallbackVideoDimension(lastReportedVideoSize.height)
 
-        let fpsText = resolvedFPS.map { String(format: "FPS %.1f", $0) } ?? "FPS --"
-        var overlayText = fpsText
-        if let resolvedWidth, let resolvedHeight, resolvedWidth > 0, resolvedHeight > 0 {
-            overlayText += " | \(resolvedWidth)x\(resolvedHeight)"
+        // Calculate bitrate
+        var bitrateKbps: Double?
+        if let bytesReceived, let lastBytes = lastVideoBytesReceived, let lastTime = lastVideoStatsTime {
+            let deltaBytes = bytesReceived - lastBytes
+            let deltaTime = now.timeIntervalSince(lastTime)
+            if deltaTime > 0 && deltaBytes >= 0 {
+                bitrateKbps = (deltaBytes * 8) / (deltaTime * 1000) // bits per second to kbps
+            }
+        }
+        lastVideoBytesReceived = bytesReceived
+        lastVideoStatsTime = now
+
+        // Get RTT from candidate pair stats
+        var rttMs: Double?
+        for (_, stat) in report.statistics where stat.type == "candidate-pair" {
+            let pairValues = stat.values
+            let selected = pairValues["selected"] as? Bool
+            let nominated = pairValues["nominated"] as? Bool
+            let state = pairValues["state"] as? String
+            if selected == true || nominated == true || state == "succeeded" {
+                if let rtt = readDoubleStatValue(pairValues["currentRoundTripTime"]) {
+                    rttMs = rtt * 1000 // Convert to ms
+                }
+                break
+            }
         }
 
+        // Build overlay text
+        let fpsText = resolvedFPS.map { String(format: "%.1f fps", $0) } ?? "-- fps"
+        var overlayParts: [String] = [fpsText]
+        
+        if let resolvedWidth, let resolvedHeight, resolvedWidth > 0, resolvedHeight > 0 {
+            overlayParts.append("\(resolvedWidth)×\(resolvedHeight)")
+        }
+        
+        if let bitrateKbps, bitrateKbps > 0 {
+            if bitrateKbps >= 1000 {
+                overlayParts.append(String(format: "%.1f Mbps", bitrateKbps / 1000))
+            } else {
+                overlayParts.append(String(format: "%.0f kbps", bitrateKbps))
+            }
+        }
+        
+        if let rttMs {
+            overlayParts.append(String(format: "%.0f ms", rttMs))
+        }
+        
+        if let state = currentConnectionState {
+            let stateText: String
+            switch state {
+            case .new: stateText = "new"
+            case .connecting: stateText = "connecting"
+            case .connected: stateText = "connected"
+            case .disconnected: stateText = "disconnected"
+            case .failed: stateText = "failed"
+            case .closed: stateText = "closed"
+            @unknown default: stateText = "unknown"
+            }
+            if state != .connected {
+                overlayParts.append(stateText)
+            }
+        }
+        
+        let overlayText = overlayParts.joined(separator: " | ")
         pipController.updateDiagnosticsOverlay(overlayText)
 
         if debugLoggingEnabled {
