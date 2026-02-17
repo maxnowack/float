@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Float",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Detects playing videos and coordinates with the Float macOS companion.",
   "icons": {
     "16": "icons/icon16.png",
@@ -51,7 +51,9 @@
       "id": "float@maxnowack.dev",
       "strict_min_version": "121.0",
       "data_collection_permissions": {
-        "required": ["none"]
+        "required": [
+          "none"
+        ]
       }
     }
   }
