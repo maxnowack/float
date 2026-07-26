@@ -28,6 +28,8 @@ popd >/dev/null
 
 cp -R "$EXTENSION_DIR/dist" "$TARGET_DIR/dist"
 cp -R "$EXTENSION_DIR/icons" "$TARGET_DIR/icons"
+cp "$EXTENSION_DIR/popup.html" "$TARGET_DIR/popup.html"
+cp "$EXTENSION_DIR/popup.css" "$TARGET_DIR/popup.css"
 
 if [[ ! -f "$TARGET_DIR/manifest.json" ]]; then
   echo "error: failed to generate firefox manifest at $TARGET_DIR/manifest.json" >&2

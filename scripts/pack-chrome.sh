@@ -29,7 +29,7 @@ if [[ ! -d dist ]]; then
   exit 1
 fi
 
-INCLUDE_PATHS=(manifest.json dist)
+INCLUDE_PATHS=(manifest.json popup.html popup.css dist)
 if [[ -d icons ]]; then
   INCLUDE_PATHS+=(icons)
 fi

@@ -7,17 +7,33 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		A1B2C3D4E5F6112233445566 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F6112233445567 /* WebRTC */; };
+		A1B2C3D4E5F6112233445566 /* LiveKitWebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F6112233445567 /* LiveKitWebRTC */; };
 /* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		B0000000000000000000000A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 00169F9C2F3F32B200CFBE98 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 00169FA32F3F32B200CFBE98;
+			remoteInfo = Float;
+		};
+/* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
 		00169FA42F3F32B200CFBE98 /* Float.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Float.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		B00000000000000000000001 /* FloatTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = FloatTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		00169FA62F3F32B200CFBE98 /* Float */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = Float;
+			sourceTree = "<group>";
+		};
+		B00000000000000000000002 /* FloatTests */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = FloatTests;
 			sourceTree = "<group>";
 		};
 /* End PBXFileSystemSynchronizedRootGroup section */
@@ -27,7 +43,14 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A1B2C3D4E5F6112233445566 /* WebRTC in Frameworks */,
+				A1B2C3D4E5F6112233445566 /* LiveKitWebRTC in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B00000000000000000000003 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -38,6 +61,7 @@
 			isa = PBXGroup;
 			children = (
 				00169FA62F3F32B200CFBE98 /* Float */,
+				B00000000000000000000002 /* FloatTests */,
 				00169FA52F3F32B200CFBE98 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -46,6 +70,7 @@
 			isa = PBXGroup;
 			children = (
 				00169FA42F3F32B200CFBE98 /* Float.app */,
+				B00000000000000000000001 /* FloatTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -70,11 +95,34 @@
 			);
 			name = Float;
 			packageProductDependencies = (
-				A1B2C3D4E5F6112233445567 /* WebRTC */,
+				A1B2C3D4E5F6112233445567 /* LiveKitWebRTC */,
 			);
 			productName = Float;
 			productReference = 00169FA42F3F32B200CFBE98 /* Float.app */;
 			productType = "com.apple.product-type.application";
+		};
+		B00000000000000000000004 /* FloatTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = B0000000000000000000000B /* Build configuration list for PBXNativeTarget "FloatTests" */;
+			buildPhases = (
+				B00000000000000000000005 /* Sources */,
+				B00000000000000000000003 /* Frameworks */,
+				B00000000000000000000006 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				B00000000000000000000007 /* PBXTargetDependency */,
+			);
+			fileSystemSynchronizedGroups = (
+				B00000000000000000000002 /* FloatTests */,
+			);
+			name = FloatTests;
+			packageProductDependencies = (
+			);
+			productName = FloatTests;
+			productReference = B00000000000000000000001 /* FloatTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
 		};
 /* End PBXNativeTarget section */
 
@@ -89,6 +137,10 @@
 					00169FA32F3F32B200CFBE98 = {
 						CreatedOnToolsVersion = 26.2;
 					};
+					B00000000000000000000004 = {
+						CreatedOnToolsVersion = 26.2;
+						TestTargetID = 00169FA32F3F32B200CFBE98;
+					};
 				};
 			};
 			buildConfigurationList = 00169F9F2F3F32B200CFBE98 /* Build configuration list for PBXProject "Float" */;
@@ -101,7 +153,7 @@
 			mainGroup = 00169F9B2F3F32B200CFBE98;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
-				A1B2C3D4E5F6112233445568 /* XCRemoteSwiftPackageReference "WebRTC" */,
+				A1B2C3D4E5F6112233445568 /* XCRemoteSwiftPackageReference "webrtc-xcframework" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 00169FA52F3F32B200CFBE98 /* Products */;
@@ -109,12 +161,20 @@
 			projectRoot = "";
 			targets = (
 				00169FA32F3F32B200CFBE98 /* Float */,
+				B00000000000000000000004 /* FloatTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
 		00169FA22F3F32B200CFBE98 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		B00000000000000000000006 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -131,7 +191,22 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
+		B00000000000000000000005 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 /* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		B00000000000000000000007 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 00169FA32F3F32B200CFBE98 /* Float */;
+			targetProxy = B0000000000000000000000A /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
 
 /* Begin XCBuildConfiguration section */
 		00169FAD2F3F32B300CFBE98 /* Debug */ = {
@@ -263,10 +338,10 @@
 				CODE_SIGN_ENTITLEMENTS = Float/Float.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 95ZC649QPM;
 				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -280,7 +355,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.2.1;
+				MARKETING_VERSION = 0.3.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-Wl,-weak_framework,PIP",
@@ -305,12 +380,13 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
 				CODE_SIGN_ENTITLEMENTS = Float/Float.entitlements;
+				CODE_SIGN_INJECT_BASE_ENTITLEMENTS = NO;
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				DEVELOPMENT_TEAM = 95ZC649QPM;
 				ENABLE_APP_SANDBOX = YES;
-				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				ENABLE_USER_SELECTED_FILES = readonly;
 				FRAMEWORK_SEARCH_PATHS = (
@@ -324,7 +400,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 0.2.1;
+				MARKETING_VERSION = 0.3.0;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-Wl,-weak_framework,PIP",
@@ -339,6 +415,36 @@
 				SWIFT_ENABLE_EXPLICIT_MODULES = NO;
 				SWIFT_UPCOMING_FEATURE_MEMBER_IMPORT_VISIBILITY = YES;
 				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+		B00000000000000000000008 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 95ZC649QPM;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				PRODUCT_BUNDLE_IDENTIFIER = de.unsou.FloatTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Float.app/Contents/MacOS/Float";
+			};
+			name = Debug;
+		};
+		B00000000000000000000009 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "$(TEST_HOST)";
+				CODE_SIGN_STYLE = Automatic;
+				DEVELOPMENT_TEAM = 95ZC649QPM;
+				GENERATE_INFOPLIST_FILE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.2;
+				PRODUCT_BUNDLE_IDENTIFIER = de.unsou.FloatTests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 5.0;
+				TEST_HOST = "$(BUILT_PRODUCTS_DIR)/Float.app/Contents/MacOS/Float";
 			};
 			name = Release;
 		};
@@ -363,24 +469,33 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
+		B0000000000000000000000B /* Build configuration list for PBXNativeTarget "FloatTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B00000000000000000000008 /* Debug */,
+				B00000000000000000000009 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
-		A1B2C3D4E5F6112233445568 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
+		A1B2C3D4E5F6112233445568 /* XCRemoteSwiftPackageReference "webrtc-xcframework" */ = {
 			isa = XCRemoteSwiftPackageReference;
-			repositoryURL = "https://github.com/alexpiezo/WebRTC";
+			repositoryURL = "https://github.com/livekit/webrtc-xcframework";
 			requirement = {
-				kind = upToNextMajorVersion;
-				minimumVersion = 95.4638.0;
+				kind = exactVersion;
+				version = 144.7559.11;
 			};
 		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
-		A1B2C3D4E5F6112233445567 /* WebRTC */ = {
+		A1B2C3D4E5F6112233445567 /* LiveKitWebRTC */ = {
 			isa = XCSwiftPackageProductDependency;
-			package = A1B2C3D4E5F6112233445568 /* XCRemoteSwiftPackageReference "WebRTC" */;
-			productName = WebRTC;
+			package = A1B2C3D4E5F6112233445568 /* XCRemoteSwiftPackageReference "webrtc-xcframework" */;
+			productName = LiveKitWebRTC;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

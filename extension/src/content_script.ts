@@ -9,7 +9,6 @@ type ContentVideoCandidate = {
 
 type VideoMeta = {
   videoId: string;
-  createdAt: number;
 };
 
 type VideoQualityProfileId = "high" | "balanced" | "performance";
@@ -38,28 +37,61 @@ type AppliedVideoSenderSettings = {
   maxBitrateBps: number;
 };
 
+type HiddenAutoStartSnapshot = {
+  capturedAtMilliseconds: number;
+  videoId: string | null;
+};
+
 const contentScriptExt: any = (globalThis as any).chrome ?? (globalThis as any).browser;
+const contentDebugLogEnabled = false;
 const videoMeta = new WeakMap<HTMLVideoElement, VideoMeta>();
+const watchedVideos = new WeakSet<HTMLVideoElement>();
 let videoCounter = 0;
 let scheduled = false;
 let activePeer: RTCPeerConnection | null = null;
 let activeStream: MediaStream | null = null;
 let activeVideoId: string | null = null;
 let activeSourceVideo: HTMLVideoElement | null = null;
+let activeMediaGeneration: number | null = null;
+let activeRequestToken: number | null = null;
+let startingVideoId: string | null = null;
+let startingMediaGeneration: number | null = null;
+let startingRequestToken: number | null = null;
+let lastStoppedVideoId: string | null = null;
+let lastStoppedMediaGeneration: number | null = null;
+let mediaSessionGeneration = 0;
+let latestMediaCommandToken = 0;
 let activeVideoSender: RTCRtpSender | null = null;
 let activeVideoSenderSettings: AppliedVideoSenderSettings | null = null;
 let activeVideoSenderUpdateInFlight = false;
 let activeVideoSenderNeedsReapply = false;
 let senderStatsTimer: number | null = null;
+let answerTimeoutTimer: number | null = null;
 let requestedVideoQualityHint: VideoQualityHint = {
   profile: "high",
   pipWidth: null,
   pipHeight: null,
 };
-let activeLocalIceCandidateCount = 0;
 let activeRemoteIceCandidateCount = 0;
 const qualityHintByVideoId = new Map<string, VideoQualityHint>();
-let didNotifyBackgroundSinceForeground = false;
+let lastHiddenAutoStartSnapshot: HiddenAutoStartSnapshot | null = null;
+const autoStartCaptureCoordinator =
+  new FloatProtocolAutoStartCaptureCoordinator();
+const autoStartCaptureTimeoutByToken = new Map<number, number>();
+let contentScriptActive = true;
+let videoObserver: MutationObserver | null = null;
+let scheduledEmitTimer: number | null = null;
+let periodicEmitTimer: number | null = null;
+const immediateVideoEvents = ["play", "pause"];
+const scheduledVideoEvents = [
+  "volumechange",
+  "timeupdate",
+  "loadedmetadata",
+  "resize",
+  "emptied",
+  "seeking",
+  "seeked",
+];
 
 // ============================================================================
 // AUDIO QUALITY CONFIGURATION
@@ -81,14 +113,96 @@ const FLOAT_VIDEO_SCALE_CHANGE_EPSILON = 0.02;
 const FLOAT_VIDEO_MIN_BITRATE_BPS = 4_000_000;
 const FLOAT_VIDEO_MAX_BITRATE_BPS = 36_000_000;
 const FLOAT_VIDEO_TARGET_BITS_PER_PIXEL = 0.11;
+const FLOAT_MAX_ICE_CANDIDATES = 256;
+const FLOAT_MAX_ICE_CANDIDATE_BYTES = 8 * 1024;
+const FLOAT_AUTO_START_SNAPSHOT_MAX_AGE_MS = 1000;
+const FLOAT_AUTO_START_CAPTURE_WAIT_MS = 500;
 const isFirefox = typeof navigator.userAgent === "string" && /firefox/i.test(navigator.userAgent);
-const isTopFrame = (() => {
+
+function runtimeId(): unknown {
   try {
-    return window.top === window;
+    return contentScriptExt?.runtime?.id;
   } catch {
+    return undefined;
+  }
+}
+
+function deactivateContentScript(): void {
+  if (!contentScriptActive) {
+    return;
+  }
+  contentScriptActive = false;
+  videoObserver?.disconnect();
+  videoObserver = null;
+  if (scheduledEmitTimer !== null) {
+    window.clearTimeout(scheduledEmitTimer);
+    scheduledEmitTimer = null;
+  }
+  if (periodicEmitTimer !== null) {
+    window.clearInterval(periodicEmitTimer);
+    periodicEmitTimer = null;
+  }
+  cancelPendingAutoStartCaptures();
+  document.removeEventListener("visibilitychange", handleVisibilityChange);
+  window.removeEventListener("beforeunload", handleBeforeUnload);
+  document.querySelectorAll("video").forEach((node) => {
+    if (!(node instanceof HTMLVideoElement)) {
+      return;
+    }
+    immediateVideoEvents.forEach((eventName) => {
+      node.removeEventListener(eventName, emitState);
+    });
+    scheduledVideoEvents.forEach((eventName) => {
+      node.removeEventListener(eventName, scheduleEmit);
+    });
+  });
+  stopStreamingResources(false);
+}
+
+function hasActiveExtensionContext(): boolean {
+  if (!contentScriptActive) {
     return false;
   }
-})();
+  if (FloatProtocolShouldDeactivateContentScript(runtimeId())) {
+    deactivateContentScript();
+    return false;
+  }
+  return true;
+}
+
+function handleRuntimeMessageFailure(error: unknown): void {
+  if (
+    FloatProtocolShouldDeactivateContentScript(
+      runtimeId(),
+      error,
+    )
+  ) {
+    deactivateContentScript();
+    return;
+  }
+  if (contentDebugLogEnabled) {
+    const reason = error instanceof Error ? error.message : String(error);
+    console.warn(`[Float CS] runtime message failed: ${reason}`);
+  }
+}
+
+function sendRuntimeMessage(message: unknown): boolean {
+  if (!hasActiveExtensionContext()) {
+    return false;
+  }
+  try {
+    const maybePromise = contentScriptExt.runtime.sendMessage(message);
+    if (maybePromise && typeof maybePromise.catch === "function") {
+      maybePromise.catch((error: unknown) => {
+        handleRuntimeMessageFailure(error);
+      });
+    }
+    return true;
+  } catch (error) {
+    handleRuntimeMessageFailure(error);
+    return false;
+  }
+}
 
 /**
  * Modifies SDP to force Opus codec with specified bitrate and channel count.
@@ -246,13 +360,16 @@ function forceOpusCodec(sdp: string): string {
 }
 
 function debugLog(event: string, payload?: Record<string, unknown>): void {
+  if (!contentDebugLogEnabled) {
+    return;
+  }
   if (typeof payload === "undefined") {
     console.log(`[Float CS] ${event}`);
   } else {
     console.log(`[Float CS] ${event}`, payload);
   }
 
-  contentScriptExt.runtime.sendMessage({
+  sendRuntimeMessage({
     type: "float:debug",
     source: "content-script",
     event,
@@ -363,15 +480,13 @@ function generateVideoId(element: HTMLVideoElement): string {
     return existing.videoId;
   }
 
-  const creationStamp = Date.now();
   videoCounter += 1;
-  const seed = `${location.href}|${window.frameElement ? "child" : "top"}|${creationStamp}|${videoCounter}`;
-  const encoded = btoa(unescape(encodeURIComponent(seed))).replace(/=+$/g, "");
-  const videoId = `vid_${encoded.slice(0, 24)}`;
+  const randomBytes = new Uint8Array(16);
+  globalThis.crypto.getRandomValues(randomBytes);
+  const videoId = FloatProtocolVideoID(randomBytes, videoCounter);
 
   videoMeta.set(element, {
     videoId,
-    createdAt: creationStamp,
   });
 
   return videoId;
@@ -415,6 +530,9 @@ function collectCandidates(): ContentVideoCandidate[] {
 }
 
 function emitState(): void {
+  if (!hasActiveExtensionContext()) {
+    return;
+  }
   const payload = {
     type: "float:videos:update",
     frameId: window.frameElement ? "child" : "top",
@@ -425,94 +543,111 @@ function emitState(): void {
     videos: collectCandidates(),
   };
 
-  contentScriptExt.runtime.sendMessage(payload);
+  sendRuntimeMessage(payload);
 }
 
-function notifyTabBackgrounded(trigger: string): void {
-  if (!isTopFrame || didNotifyBackgroundSinceForeground) {
+function recordVisibilityAutoStartSnapshot(): void {
+  if (document.visibilityState !== "hidden") {
+    lastHiddenAutoStartSnapshot = null;
     return;
   }
 
-  didNotifyBackgroundSinceForeground = true;
-  contentScriptExt.runtime.sendMessage({
-    type: "float:tab:background",
-    trigger,
-    page: {
-      title: document.title,
-      url: location.href,
-    },
-    visibilityState: document.visibilityState,
-    hasFocus: document.hasFocus(),
-  });
+  lastHiddenAutoStartSnapshot = {
+    capturedAtMilliseconds: Date.now(),
+    videoId: FloatProtocolAutoStartVideoId(collectCandidates()),
+  };
 }
 
-function notifyTabForegrounded(trigger: string): void {
-  if (!isTopFrame || !didNotifyBackgroundSinceForeground) {
-    return;
+function cancelPendingAutoStartCaptures(): void {
+  autoStartCaptureCoordinator.cancelAll();
+  for (const timeout of autoStartCaptureTimeoutByToken.values()) {
+    window.clearTimeout(timeout);
   }
-
-  didNotifyBackgroundSinceForeground = false;
-  contentScriptExt.runtime.sendMessage({
-    type: "float:tab:foreground",
-    trigger,
-    page: {
-      title: document.title,
-      url: location.href,
-    },
-    visibilityState: document.visibilityState,
-    hasFocus: document.hasFocus(),
-  });
+  autoStartCaptureTimeoutByToken.clear();
 }
 
-function markTabForegrounded(): void {
-  didNotifyBackgroundSinceForeground = false;
+function resolvePendingAutoStartCaptures(): void {
+  const responses = autoStartCaptureCoordinator.resolve(
+    lastHiddenAutoStartSnapshot,
+    document.visibilityState,
+    Date.now(),
+    FLOAT_AUTO_START_SNAPSHOT_MAX_AGE_MS,
+  );
+  for (const response of responses) {
+    const timeout = autoStartCaptureTimeoutByToken.get(response.token);
+    if (typeof timeout === "number") {
+      window.clearTimeout(timeout);
+    }
+    autoStartCaptureTimeoutByToken.delete(response.token);
+    sendRuntimeMessage({
+      type: "float:autoStart:candidate",
+      token: response.token,
+      videoId: response.videoId,
+    });
+  }
+}
+
+function beginAutoStartCapture(token: number): void {
+  const existingTimeout = autoStartCaptureTimeoutByToken.get(token);
+  if (typeof existingTimeout === "number") {
+    window.clearTimeout(existingTimeout);
+  }
+  autoStartCaptureCoordinator.begin(token);
+  autoStartCaptureTimeoutByToken.set(
+    token,
+    window.setTimeout(() => {
+      autoStartCaptureCoordinator.cancel(token);
+      autoStartCaptureTimeoutByToken.delete(token);
+    }, FLOAT_AUTO_START_CAPTURE_WAIT_MS),
+  );
+  resolvePendingAutoStartCaptures();
 }
 
 function scheduleEmit(): void {
-  if (scheduled) {
+  if (!hasActiveExtensionContext() || scheduled) {
     return;
   }
 
   scheduled = true;
-  window.setTimeout(() => {
+  scheduledEmitTimer = window.setTimeout(() => {
+    scheduledEmitTimer = null;
     scheduled = false;
     emitState();
   }, 100);
 }
 
 function watchVideo(video: HTMLVideoElement): void {
-  const events = [
-    "play",
-    "pause",
-    "volumechange",
-    "timeupdate",
-    "loadedmetadata",
-    "resize",
-    "emptied",
-    "seeking",
-    "seeked",
-  ];
-
-  events.forEach((eventName) => {
+  immediateVideoEvents.forEach((eventName) => {
+    video.addEventListener(eventName, emitState, { passive: true });
+  });
+  scheduledVideoEvents.forEach((eventName) => {
     video.addEventListener(eventName, scheduleEmit, { passive: true });
   });
 }
 
 function refreshVideoWatchers(): void {
+  if (!hasActiveExtensionContext()) {
+    return;
+  }
   document.querySelectorAll("video").forEach((node) => {
-    if (node instanceof HTMLVideoElement) {
-      watchVideo(node);
-      generateVideoId(node);
+    if (!(node instanceof HTMLVideoElement) || watchedVideos.has(node)) {
+      return;
     }
+    watchedVideos.add(node);
+    watchVideo(node);
+    generateVideoId(node);
   });
 }
 
-const observer = new MutationObserver(() => {
+videoObserver = new MutationObserver(() => {
+  if (!hasActiveExtensionContext()) {
+    return;
+  }
   refreshVideoWatchers();
   scheduleEmit();
 });
 
-observer.observe(document.documentElement, {
+videoObserver.observe(document.documentElement, {
   childList: true,
   subtree: true,
   attributes: true,
@@ -521,42 +656,35 @@ observer.observe(document.documentElement, {
 
 refreshVideoWatchers();
 scheduleEmit();
-window.setInterval(scheduleEmit, 2000);
-if (isTopFrame) {
-  window.addEventListener(
-    "blur",
-    () => {
-      notifyTabBackgrounded("window.blur");
-    },
-    { passive: true },
-  );
+periodicEmitTimer = window.setInterval(scheduleEmit, 2000);
 
-  window.addEventListener(
-    "focus",
-    () => {
-      notifyTabForegrounded("window.focus");
-    },
-    { passive: true },
-  );
-
-  document.addEventListener(
-    "visibilitychange",
-    () => {
-      if (document.visibilityState === "hidden") {
-        notifyTabBackgrounded("document.visibilitychange.hidden");
-        return;
-      }
-      notifyTabForegrounded("document.visibilitychange.visible");
-    },
-    { passive: true },
-  );
+function handleVisibilityChange(): void {
+  if (!hasActiveExtensionContext()) {
+    return;
+  }
+  recordVisibilityAutoStartSnapshot();
+  if (document.visibilityState === "hidden") {
+    resolvePendingAutoStartCaptures();
+  } else {
+    cancelPendingAutoStartCaptures();
+  }
+  emitState();
 }
-window.addEventListener("beforeunload", () => {
+
+function handleBeforeUnload(): void {
+  if (!contentScriptActive) {
+    return;
+  }
   stopStreaming();
-  contentScriptExt.runtime.sendMessage({
+  sendRuntimeMessage({
     type: "float:videos:clear",
   });
+}
+
+document.addEventListener("visibilitychange", handleVisibilityChange, {
+  passive: true,
 });
+window.addEventListener("beforeunload", handleBeforeUnload);
 
 function findVideoById(targetVideoId: string): HTMLVideoElement | null {
   const videos = document.querySelectorAll("video");
@@ -592,11 +720,20 @@ function findBestAvailableVideo(): HTMLVideoElement | null {
   return eligible[0] ?? null;
 }
 
-function notifyWebRTCError(reason: string): void {
-  contentScriptExt.runtime.sendMessage({
+function notifyWebRTCError(
+  reason: string,
+  videoId: string | null,
+  generation: number | null,
+  requestToken: number | null,
+  terminal: boolean,
+): void {
+  sendRuntimeMessage({
     type: "float:webrtc:error",
     reason,
-    videoId: activeVideoId,
+    videoId,
+    generation,
+    requestToken,
+    terminal,
   });
 }
 
@@ -962,17 +1099,36 @@ async function applySenderQualitySettings(
   }
 }
 
-function stopStreaming(): void {
+function nextMediaSessionGeneration(): number {
+  mediaSessionGeneration = FloatProtocolNextMediaGeneration(
+    mediaSessionGeneration,
+  );
+  return mediaSessionGeneration;
+}
+
+function disposeLocalMedia(peer: RTCPeerConnection, stream: MediaStream): void {
+  peer.onicecandidate = null;
+  peer.onconnectionstatechange = null;
+  peer.oniceconnectionstatechange = null;
+  peer.onicegatheringstatechange = null;
+  peer.close();
+  stream.getTracks().forEach((track) => track.stop());
+}
+
+function stopStreamingResources(notifyWorker = true): void {
   requestedVideoQualityHint = defaultVideoQualityHint();
   activeVideoSenderNeedsReapply = false;
   activeVideoSenderUpdateInFlight = false;
   activeVideoSenderSettings = null;
   activeVideoSender = null;
-  activeLocalIceCandidateCount = 0;
   activeRemoteIceCandidateCount = 0;
   if (senderStatsTimer !== null) {
     clearInterval(senderStatsTimer);
     senderStatsTimer = null;
+  }
+  if (answerTimeoutTimer !== null) {
+    clearTimeout(answerTimeoutTimer);
+    answerTimeoutTimer = null;
   }
 
   if (activePeer) {
@@ -989,13 +1145,84 @@ function stopStreaming(): void {
 
   if (activeVideoId) {
     qualityHintByVideoId.delete(activeVideoId);
-    contentScriptExt.runtime.sendMessage({
-      type: "float:webrtc:stopped",
-      videoId: activeVideoId,
-    });
+    if (notifyWorker) {
+      sendRuntimeMessage({
+        type: "float:webrtc:stopped",
+        videoId: activeVideoId,
+        generation: activeMediaGeneration,
+        requestToken: activeRequestToken,
+      });
+    }
   }
   activeSourceVideo = null;
   activeVideoId = null;
+  activeMediaGeneration = null;
+  activeRequestToken = null;
+  startingVideoId = null;
+  startingMediaGeneration = null;
+  startingRequestToken = null;
+}
+
+function stopStreaming(): void {
+  const stoppedVideoId = activeVideoId ?? startingVideoId;
+  const stoppedGeneration =
+    activeMediaGeneration ?? startingMediaGeneration;
+  if (stoppedVideoId !== null && stoppedGeneration !== null) {
+    lastStoppedVideoId = stoppedVideoId;
+    lastStoppedMediaGeneration = stoppedGeneration;
+  }
+  nextMediaSessionGeneration();
+  stopStreamingResources();
+}
+
+function clearStartingStream(generation: number): void {
+  if (startingMediaGeneration === generation) {
+    startingVideoId = null;
+    startingMediaGeneration = null;
+    startingRequestToken = null;
+  }
+}
+
+function pauseAndStopStreaming(videoId: string, generation: number): void {
+  const ownsActiveStream =
+    activeVideoId === videoId && activeMediaGeneration === generation;
+  const ownsStartingStream =
+    startingVideoId === videoId &&
+    startingMediaGeneration === generation &&
+    mediaSessionGeneration === generation;
+  const matchesLastStoppedStream =
+    activeVideoId === null &&
+    startingVideoId === null &&
+    lastStoppedVideoId === videoId &&
+    lastStoppedMediaGeneration === generation;
+  if (!ownsActiveStream && !ownsStartingStream && !matchesLastStoppedStream) {
+    return;
+  }
+  const operationRequestToken = ownsActiveStream
+    ? activeRequestToken
+    : ownsStartingStream
+      ? startingRequestToken
+      : null;
+
+  const target =
+    (ownsActiveStream ? activeSourceVideo : null) ?? findVideoById(videoId);
+  if (target) {
+    try {
+      target.pause();
+      scheduleEmit();
+    } catch (error) {
+      const reason =
+        error instanceof Error ? error.message : "failed to pause source video";
+      notifyWebRTCError(reason, videoId, generation, operationRequestToken, false);
+    }
+  }
+
+  if (ownsActiveStream || ownsStartingStream) {
+    stopStreaming();
+  } else {
+    lastStoppedVideoId = null;
+    lastStoppedMediaGeneration = null;
+  }
 }
 
 function captureVideoStream(video: HTMLVideoElement): MediaStream {
@@ -1008,16 +1235,39 @@ function captureVideoStream(video: HTMLVideoElement): MediaStream {
   throw new Error("captureStream is unavailable in this browser");
 }
 
-async function startStreaming(videoId: string): Promise<void> {
-  stopStreaming();
+async function startStreaming(
+  videoId: string,
+  requestToken: number,
+  autoStartToken: number | null,
+): Promise<void> {
+  const generation = nextMediaSessionGeneration();
+  stopStreamingResources();
+  lastStoppedVideoId = null;
+  lastStoppedMediaGeneration = null;
   requestedVideoQualityHint = defaultVideoQualityHint();
 
   let selectedVideoId = videoId;
   let video = findVideoById(videoId);
-  if (!video) {
+  if (autoStartToken !== null && (!video || video.paused || video.ended)) {
+    sendRuntimeMessage({
+      type: "float:autoStart:rejected",
+      token: autoStartToken,
+      requestToken,
+      videoId,
+    });
+    emitState();
+    return;
+  }
+  if (!video && autoStartToken === null) {
     video = findBestAvailableVideo();
     if (!video) {
-      notifyWebRTCError(`Video ${videoId} is no longer available`);
+      notifyWebRTCError(
+        `Video ${videoId} is no longer available`,
+        videoId,
+        generation,
+        requestToken,
+        true,
+      );
       return;
     }
     selectedVideoId = generateVideoId(video);
@@ -1025,10 +1275,19 @@ async function startStreaming(videoId: string): Promise<void> {
   }
 
   if (!video) {
-    notifyWebRTCError(`Video ${videoId} is no longer available`);
+    notifyWebRTCError(
+      `Video ${videoId} is no longer available`,
+      videoId,
+      generation,
+      requestToken,
+      true,
+    );
     return;
   }
 
+  startingVideoId = selectedVideoId;
+  startingMediaGeneration = generation;
+  startingRequestToken = requestToken;
   debugLog("source.selected", {
     requestedVideoId: videoId,
     selectedVideoId,
@@ -1040,13 +1299,15 @@ async function startStreaming(videoId: string): Promise<void> {
   requestedVideoQualityHint = {
     ...(qualityHintByVideoId.get(selectedVideoId) ?? defaultVideoQualityHint()),
   };
+  const sessionQualityHint = { ...requestedVideoQualityHint };
 
   let stream: MediaStream;
   try {
     stream = captureVideoStream(video);
   } catch (error) {
     const reason = error instanceof Error ? error.message : "captureStream failed";
-    notifyWebRTCError(reason);
+    notifyWebRTCError(reason, selectedVideoId, generation, requestToken, true);
+    clearStartingStream(generation);
     return;
   }
 
@@ -1054,13 +1315,25 @@ async function startStreaming(videoId: string): Promise<void> {
   const audioTracks = stream.getAudioTracks();
 
   if (videoTracks.length === 0) {
-    notifyWebRTCError("captureStream returned no video track");
+    notifyWebRTCError(
+      "captureStream returned no video track",
+      selectedVideoId,
+      generation,
+      requestToken,
+      true,
+    );
     stream.getTracks().forEach((track) => track.stop());
+    clearStartingStream(generation);
     return;
   }
 
   const primaryVideoTrack = videoTracks[0];
   await applyTrackQualitySettings(selectedVideoId, primaryVideoTrack, audioTracks);
+  if (generation !== mediaSessionGeneration) {
+    stream.getTracks().forEach((track) => track.stop());
+    clearStartingStream(generation);
+    return;
+  }
 
   const trackSettings = primaryVideoTrack.getSettings();
   debugLog("source.track", {
@@ -1126,19 +1399,32 @@ async function startStreaming(videoId: string): Promise<void> {
   await Promise.all(
     senders.map(async (sender) => {
       if (sender.track?.kind === "video") {
-        initialVideoSettings = await applySenderQualitySettings(sender, selectedVideoId, requestedVideoQualityHint);
+        initialVideoSettings = await applySenderQualitySettings(
+          sender,
+          selectedVideoId,
+          sessionQualityHint,
+        );
         return;
       }
       await applySenderQualitySettings(sender, selectedVideoId);
     }),
   );
+  if (generation !== mediaSessionGeneration) {
+    disposeLocalMedia(peer, stream);
+    clearStartingStream(generation);
+    return;
+  }
   const primaryVideoSender = senders.find((sender) => sender.track?.kind === "video") ?? null;
+  let localIceCandidateCount = 0;
 
   peer.onicecandidate = (event) => {
+    if (generation !== mediaSessionGeneration) {
+      return;
+    }
     if (!event.candidate) {
       debugLog("sender.ice.local.completed", {
         selectedVideoId,
-        localCandidateCount: activeLocalIceCandidateCount,
+        localCandidateCount: localIceCandidateCount,
       });
       return;
     }
@@ -1148,19 +1434,34 @@ async function startStreaming(videoId: string): Promise<void> {
     if (candidate.length === 0) {
       return;
     }
-    activeLocalIceCandidateCount += 1;
+    if (
+      localIceCandidateCount >= FLOAT_MAX_ICE_CANDIDATES ||
+      new TextEncoder().encode(candidate).byteLength > FLOAT_MAX_ICE_CANDIDATE_BYTES
+    ) {
+      notifyWebRTCError(
+        "Local ICE candidate limit exceeded",
+        selectedVideoId,
+        generation,
+        requestToken,
+        true,
+      );
+      return;
+    }
+    localIceCandidateCount += 1;
     debugLog("sender.ice.local", {
       selectedVideoId,
-      localCandidateCount: activeLocalIceCandidateCount,
+      localCandidateCount: localIceCandidateCount,
       sdpMid: event.candidate.sdpMid ?? null,
       sdpMLineIndex: event.candidate.sdpMLineIndex ?? null,
       protocol: event.candidate.protocol ?? null,
       candidateType: event.candidate.type ?? null,
     });
 
-    contentScriptExt.runtime.sendMessage({
+    sendRuntimeMessage({
       type: "float:webrtc:ice",
       videoId: selectedVideoId,
+      generation,
+      requestToken,
       candidate,
       sdpMid: event.candidate.sdpMid,
       sdpMLineIndex: event.candidate.sdpMLineIndex,
@@ -1168,6 +1469,9 @@ async function startStreaming(videoId: string): Promise<void> {
   };
 
   peer.onconnectionstatechange = () => {
+    if (generation !== mediaSessionGeneration) {
+      return;
+    }
     debugLog("sender.connectionState.changed", {
       selectedVideoId,
       connectionState: peer.connectionState,
@@ -1177,11 +1481,21 @@ async function startStreaming(videoId: string): Promise<void> {
       return;
     }
     if (peer.connectionState === "failed" || peer.connectionState === "closed") {
-      notifyWebRTCError(`Peer state changed to ${peer.connectionState}`);
+      notifyWebRTCError(
+        `Peer state changed to ${peer.connectionState}`,
+        selectedVideoId,
+        generation,
+        requestToken,
+        true,
+      );
+      stopStreaming();
     }
   };
 
   peer.oniceconnectionstatechange = () => {
+    if (generation !== mediaSessionGeneration) {
+      return;
+    }
     debugLog("sender.iceConnectionState.changed", {
       selectedVideoId,
       iceConnectionState: peer.iceConnectionState,
@@ -1189,6 +1503,9 @@ async function startStreaming(videoId: string): Promise<void> {
   };
 
   peer.onicegatheringstatechange = () => {
+    if (generation !== mediaSessionGeneration) {
+      return;
+    }
     debugLog("sender.iceGatheringState.changed", {
       selectedVideoId,
       iceGatheringState: peer.iceGatheringState,
@@ -1197,6 +1514,11 @@ async function startStreaming(videoId: string): Promise<void> {
 
   try {
     const offer = await peer.createOffer();
+    if (generation !== mediaSessionGeneration) {
+      disposeLocalMedia(peer, stream);
+      clearStartingStream(generation);
+      return;
+    }
     const rawOfferSdp = offer.sdp;
     if (typeof rawOfferSdp !== "string" || rawOfferSdp.length === 0) {
       throw new Error("offer SDP is missing");
@@ -1235,12 +1557,20 @@ async function startStreaming(videoId: string): Promise<void> {
       type: "offer",
       sdp: offerSdp,
     });
+    if (generation !== mediaSessionGeneration) {
+      disposeLocalMedia(peer, stream);
+      clearStartingStream(generation);
+      return;
+    }
 
     const localOfferSdp = peer.localDescription?.sdp ?? offerSdp;
     activePeer = peer;
     activeStream = stream;
     activeVideoId = selectedVideoId;
     activeSourceVideo = video;
+    activeMediaGeneration = generation;
+    activeRequestToken = requestToken;
+    clearStartingStream(generation);
     activeVideoSender = primaryVideoSender;
     activeVideoSenderSettings = initialVideoSettings;
     activeVideoSenderUpdateInFlight = false;
@@ -1288,17 +1618,42 @@ async function startStreaming(videoId: string): Promise<void> {
       }, 1000);
     }
 
-    contentScriptExt.runtime.sendMessage({
+    sendRuntimeMessage({
       type: "float:webrtc:offer",
       videoId: selectedVideoId,
+      generation,
+      requestToken,
       sdp: localOfferSdp,
     });
+    answerTimeoutTimer = window.setTimeout(() => {
+      if (
+        generation !== mediaSessionGeneration ||
+        activeMediaGeneration !== generation
+      ) {
+        return;
+      }
+      notifyWebRTCError(
+        "WebRTC negotiation timed out",
+        selectedVideoId,
+        generation,
+        requestToken,
+        true,
+      );
+      stopStreaming();
+    }, 10_000);
   } catch (error) {
     const reason = error instanceof Error ? error.message : "offer creation failed";
-    notifyWebRTCError(reason);
-    peer.close();
-    stream.getTracks().forEach((track) => track.stop());
-    activeSourceVideo = null;
+    disposeLocalMedia(peer, stream);
+    if (generation === mediaSessionGeneration) {
+      notifyWebRTCError(reason, selectedVideoId, generation, requestToken, true);
+      if (
+        activeMediaGeneration === generation ||
+        startingMediaGeneration === generation
+      ) {
+        stopStreaming();
+      }
+    }
+    clearStartingStream(generation);
   }
 }
 
@@ -1306,10 +1661,18 @@ async function applyPlaybackControl(videoId: string, playing: boolean): Promise<
   if (activeVideoId !== videoId) {
     return;
   }
+  const operationGeneration = activeMediaGeneration;
+  const operationRequestToken = activeRequestToken;
 
   const target = activeSourceVideo ?? findVideoById(videoId);
   if (!target) {
-    notifyWebRTCError(`Playback control target not found for ${videoId}`);
+    notifyWebRTCError(
+      `Playback control target not found for ${videoId}`,
+      videoId,
+      operationGeneration,
+      operationRequestToken,
+      false,
+    );
     return;
   }
 
@@ -1324,7 +1687,13 @@ async function applyPlaybackControl(videoId: string, playing: boolean): Promise<
     scheduleEmit();
   } catch (error) {
     const reason = error instanceof Error ? error.message : "failed to apply playback control";
-    notifyWebRTCError(reason);
+    notifyWebRTCError(
+      reason,
+      videoId,
+      operationGeneration,
+      operationRequestToken,
+      false,
+    );
   }
 }
 
@@ -1332,13 +1701,21 @@ function applySeekControl(videoId: string, intervalSeconds: number): void {
   if (activeVideoId !== videoId) {
     return;
   }
+  const operationGeneration = activeMediaGeneration;
+  const operationRequestToken = activeRequestToken;
   if (!Number.isFinite(intervalSeconds)) {
     return;
   }
 
   const target = activeSourceVideo ?? findVideoById(videoId);
   if (!target) {
-    notifyWebRTCError(`Seek target not found for ${videoId}`);
+    notifyWebRTCError(
+      `Seek target not found for ${videoId}`,
+      videoId,
+      operationGeneration,
+      operationRequestToken,
+      false,
+    );
     return;
   }
 
@@ -1359,12 +1736,27 @@ function applySeekControl(videoId: string, intervalSeconds: number): void {
     scheduleEmit();
   } catch (error) {
     const reason = error instanceof Error ? error.message : "failed to apply seek control";
-    notifyWebRTCError(reason);
+    notifyWebRTCError(
+      reason,
+      videoId,
+      operationGeneration,
+      operationRequestToken,
+      false,
+    );
   }
 }
 
-async function applyAnswer(videoId: string, sdp: string): Promise<void> {
-  if (!activePeer || activeVideoId !== videoId) {
+async function applyAnswer(
+  videoId: string,
+  generation: number,
+  sdp: string,
+): Promise<void> {
+  if (
+    !activePeer ||
+    activeVideoId !== videoId ||
+    activeMediaGeneration !== generation ||
+    mediaSessionGeneration !== generation
+  ) {
     return;
   }
 
@@ -1373,16 +1765,33 @@ async function applyAnswer(videoId: string, sdp: string): Promise<void> {
     type: "answer",
     sdp: answerSdp,
   });
+  if (
+    activeVideoId === videoId &&
+    activeMediaGeneration === generation &&
+    answerTimeoutTimer !== null
+  ) {
+    clearTimeout(answerTimeoutTimer);
+    answerTimeoutTimer = null;
+  }
 }
 
 async function addIceCandidate(
   videoId: string,
+  generation: number,
   candidate: string,
   sdpMid: string | null,
   sdpMLineIndex: number | null,
 ): Promise<void> {
-  if (!activePeer || activeVideoId !== videoId) {
+  if (
+    !activePeer ||
+    activeVideoId !== videoId ||
+    activeMediaGeneration !== generation ||
+    mediaSessionGeneration !== generation
+  ) {
     return;
+  }
+  if (activeRemoteIceCandidateCount >= FLOAT_MAX_ICE_CANDIDATES) {
+    throw new Error("Remote ICE candidate limit exceeded");
   }
 
   activeRemoteIceCandidateCount += 1;
@@ -1402,18 +1811,122 @@ async function addIceCandidate(
   );
 }
 
+function requestTokenForActiveMedia(
+  videoId: string,
+  generation: number,
+): number | null {
+  if (
+    activeVideoId !== videoId ||
+    activeMediaGeneration !== generation
+  ) {
+    return null;
+  }
+  return activeRequestToken;
+}
+
+function acceptMediaCommandToken(value: unknown): value is number {
+  if (!FloatProtocolIsNewerMediaCommandToken(latestMediaCommandToken, value)) {
+    return false;
+  }
+  latestMediaCommandToken = value;
+  return true;
+}
+
 contentScriptExt.runtime.onMessage.addListener((message: any) => {
   if (!message || typeof message.type !== "string") {
     return;
   }
 
-  if (message.type === "float:start" && typeof message.videoId === "string") {
-    void startStreaming(message.videoId);
+  if (
+    message.type === "float:autoStart:capture" &&
+    Number.isSafeInteger(message.token) &&
+    message.token > 0
+  ) {
+    beginAutoStartCapture(message.token);
     return;
   }
 
-  if (message.type === "float:stop") {
-    stopStreaming();
+  if (
+    message.type === "float:start" &&
+    typeof message.videoId === "string" &&
+    acceptMediaCommandToken(message.requestToken)
+  ) {
+    const autoStartToken =
+      message.requirePlaying === true &&
+      Number.isSafeInteger(message.autoStartToken) &&
+      message.autoStartToken > 0
+        ? message.autoStartToken
+        : null;
+    if (message.requirePlaying === true && autoStartToken === null) {
+      return;
+    }
+    void startStreaming(message.videoId, message.requestToken, autoStartToken);
+    return;
+  }
+
+  if (
+    message.type === "float:stop" &&
+    Number.isSafeInteger(message.commandToken)
+  ) {
+    const hasNoTarget =
+      typeof message.videoId === "undefined" &&
+      typeof message.generation === "undefined" &&
+      typeof message.requestToken === "undefined";
+    const hasValidTarget =
+      typeof message.videoId === "string" &&
+      message.videoId.length > 0 &&
+      Number.isSafeInteger(message.generation) &&
+      message.generation > 0 &&
+      Number.isSafeInteger(message.requestToken) &&
+      message.requestToken > 0;
+    if (
+      !hasNoTarget &&
+      !hasValidTarget
+    ) {
+      return;
+    }
+    if (!acceptMediaCommandToken(message.commandToken)) {
+      return;
+    }
+    if (hasNoTarget) {
+      stopStreaming();
+      return;
+    }
+    const expectedSession = {
+      videoId: message.videoId,
+      generation: message.generation,
+      requestToken: message.requestToken,
+    };
+    const ownsActiveSession = FloatProtocolMediaSessionMatches(
+      {
+        videoId: activeVideoId,
+        generation: activeMediaGeneration,
+        requestToken: activeRequestToken,
+      },
+      expectedSession,
+    );
+    const ownsStartingSession = FloatProtocolMediaSessionMatches(
+      {
+        videoId: startingVideoId,
+        generation: startingMediaGeneration,
+        requestToken: startingRequestToken,
+      },
+      expectedSession,
+    );
+    if (ownsActiveSession || ownsStartingSession) {
+      stopStreaming();
+    }
+    return;
+  }
+
+  if (
+    message.type === "float:pauseAndStop" &&
+    typeof message.videoId === "string" &&
+    Number.isSafeInteger(message.generation) &&
+    message.generation > 0 &&
+    message.generation <= 0x7fff_ffff
+  ) {
+    pauseAndStopStreaming(message.videoId, message.generation);
     return;
   }
 
@@ -1447,10 +1960,28 @@ contentScriptExt.runtime.onMessage.addListener((message: any) => {
     return;
   }
 
-  if (message.type === "float:signal:answer" && typeof message.videoId === "string" && typeof message.sdp === "string") {
-    void applyAnswer(message.videoId, message.sdp).catch((error) => {
+  if (
+    message.type === "float:signal:answer" &&
+    typeof message.videoId === "string" &&
+    Number.isSafeInteger(message.generation) &&
+    typeof message.sdp === "string"
+  ) {
+    const requestToken = requestTokenForActiveMedia(
+      message.videoId,
+      message.generation,
+    );
+    void applyAnswer(message.videoId, message.generation, message.sdp).catch((error) => {
       const reason = error instanceof Error ? error.message : "failed to apply answer";
-      notifyWebRTCError(reason);
+      notifyWebRTCError(
+        reason,
+        message.videoId,
+        message.generation,
+        requestToken,
+        true,
+      );
+      if (activeMediaGeneration === message.generation) {
+        stopStreaming();
+      }
     });
     return;
   }
@@ -1458,16 +1989,28 @@ contentScriptExt.runtime.onMessage.addListener((message: any) => {
   if (
     message.type === "float:signal:ice" &&
     typeof message.videoId === "string" &&
+    Number.isSafeInteger(message.generation) &&
     typeof message.candidate === "string"
   ) {
+    const requestToken = requestTokenForActiveMedia(
+      message.videoId,
+      message.generation,
+    );
     void addIceCandidate(
       message.videoId,
+      message.generation,
       message.candidate,
       message.sdpMid ?? null,
       typeof message.sdpMLineIndex === "number" ? message.sdpMLineIndex : null,
     ).catch((error) => {
       const reason = error instanceof Error ? error.message : "failed to apply ICE candidate";
-      notifyWebRTCError(reason);
+      notifyWebRTCError(
+        reason,
+        message.videoId,
+        message.generation,
+        requestToken,
+        false,
+      );
     });
   }
 });

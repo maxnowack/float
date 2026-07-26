@@ -40,3 +40,4 @@ Pods/
 *.app
 *.dmg
 *.zip
+artifacts/SHA256SUMS*.txt

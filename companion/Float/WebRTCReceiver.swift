@@ -3,17 +3,35 @@ import Foundation
 struct LocalIceCandidate {
     let tabId: Int
     let videoId: String
+    let generation: Int
     let candidate: String
     let sdpMid: String?
     let sdpMLineIndex: Int?
 }
 
+struct WebRTCMediaSource: Equatable {
+    let tabId: Int
+    let videoId: String
+    let generation: Int
+
+    func matches(
+        tabId: Int?,
+        videoId: String?,
+        generation: Int?
+    ) -> Bool {
+        self.tabId == tabId &&
+            self.videoId == videoId &&
+            self.generation == generation
+    }
+}
+
 protocol WebRTCReceiver {
     var onLocalIceCandidate: ((LocalIceCandidate) -> Void)? { get set }
-    var onStreamingChanged: ((Bool) -> Void)? { get set }
-    var onPlaybackCommand: ((Bool) -> Void)? { get set }
-    var onSeekCommand: ((Double) -> Void)? { get set }
-    var onPiPRenderSizeChanged: ((CGSize) -> Void)? { get set }
+    var onStreamingChanged: ((WebRTCMediaSource, Bool) -> Void)? { get set }
+    var onPictureInPictureClosed: ((Int, String, Int) -> Void)? { get set }
+    var onPlaybackCommand: ((WebRTCMediaSource, Bool) -> Void)? { get set }
+    var onSeekCommand: ((WebRTCMediaSource, Double) -> Void)? { get set }
+    var onPiPRenderSizeChanged: ((WebRTCMediaSource, CGSize) -> Void)? { get set }
     func handleOffer(_ offer: OfferMessage) async throws -> String
     func addRemoteIceCandidate(_ ice: IceMessage) async throws
     func stop()
@@ -48,12 +66,12 @@ enum WebRTCReceiverError: LocalizedError {
 }
 
 func makeWebRTCReceiver() -> WebRTCReceiver {
-#if canImport(WebRTC)
+#if canImport(LiveKitWebRTC)
     guard NativeLibWebRTCReceiver.isSupported else {
         fatalError("Native WebRTC receiver is not supported on this system.")
     }
     return NativeLibWebRTCReceiver()
 #else
-    fatalError("Native WebRTC receiver requires linking the WebRTC framework.")
+    fatalError("Native WebRTC receiver requires linking the LiveKitWebRTC framework.")
 #endif
 }

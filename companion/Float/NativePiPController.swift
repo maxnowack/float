@@ -2,15 +2,75 @@ import AppKit
 import Darwin
 import Foundation
 import ObjectiveC.runtime
+import OSLog
+
+struct PiPPresentationEpochTracker {
+    private(set) var current: UInt64?
+    private(set) var dismissing: UInt64?
+    private var lastIssued: UInt64 = 0
+
+    var canBeginPresentation: Bool {
+        current == nil && dismissing == nil
+    }
+
+    mutating func begin() -> UInt64? {
+        guard canBeginPresentation else { return nil }
+        lastIssued = lastIssued == UInt64.max ? 1 : lastIssued + 1
+        current = lastIssued
+        return lastIssued
+    }
+
+    func matches(_ epoch: UInt64) -> Bool {
+        current == epoch
+    }
+
+    @discardableResult
+    mutating func end(_ epoch: UInt64) -> Bool {
+        guard current == epoch else { return false }
+        current = nil
+        return true
+    }
+
+    @discardableResult
+    mutating func beginDismissal(_ epoch: UInt64) -> Bool {
+        guard current == epoch, dismissing == nil else { return false }
+        dismissing = epoch
+        return true
+    }
+
+    @discardableResult
+    mutating func completeDismissal(_ epoch: UInt64) -> Bool {
+        guard dismissing == epoch else { return false }
+        dismissing = nil
+        return true
+    }
+
+    func isDismissing(_ epoch: UInt64) -> Bool {
+        dismissing == epoch
+    }
+
+    mutating func cancel() {
+        current = nil
+    }
+}
 
 @MainActor
 final class NativePiPController: NSObject {
     private enum Constants {
         static let defaultHostSize = CGSize(width: 1280, height: 720)
         static let visibilityWatchdogInterval: TimeInterval = 0.4
+        static let dismissalWatchdogInterval: TimeInterval = 0.05
+        static let dismissalTimeout: TimeInterval = 2.0
     }
 
-    var onPictureInPictureClosed: (() -> Void)?
+    private enum PiPDismissalMechanism: Equatable {
+        case completionHandler
+        case legacy
+        case unavailable
+    }
+
+    var onPictureInPictureStarted: ((UInt64) -> Void)?
+    var onPictureInPictureClosed: ((UInt64) -> Void)?
     var onPlaybackCommand: ((Bool) -> Void)?
     var onSeekCommand: ((Double) -> Void)?
     var onPiPRenderSizeChanged: ((CGSize) -> Void)?
@@ -29,7 +89,7 @@ final class NativePiPController: NSObject {
     private var privatePiPPresented = false
     private var wantsStart = false
     private var isStartingPictureInPicture = false
-    private var isStoppingPrivatePiPProgrammatically = false
+    private var presentationEpochs = PiPPresentationEpochTracker()
 
     private var expectedVideoAspectRatio: CGFloat = 16.0 / 9.0
 
@@ -37,12 +97,19 @@ final class NativePiPController: NSObject {
     private var privatePiPPanelCloseObserver: NSObjectProtocol?
     private var privatePiPPanelResizeObserver: NSObjectProtocol?
     private var privatePiPVisibilityWatchdog: Timer?
+    private var privatePiPDismissalPanel: NSWindow?
+    private var privatePiPDismissalCloseObserver: NSObjectProtocol?
+    private var privatePiPDismissalWatchdog: Timer?
+    private var privatePiPDismissalControllerCompleted = false
+    private var privatePiPDismissalPanelWillClose = false
+    private var privatePiPDismissalRequiresControllerCompletion = true
+    private var privatePiPDismissalDeadline: Date?
     private var isObservingPrivatePiPPanel = false
     private var isObservingPrivatePiPPlaying = false
     private var privatePiPPanelKVOContext = 0
     private var privatePiPPlayingKVOContext = 0
     private var isUpdatingPlaybackStateProgrammatically = false
-    private var suppressPlaybackCommands = false
+    private var suppressPlaybackCommands = true
     private var defaultPrivatePiPControls: UInt64 = 3
     private var defaultPrivatePiPControlStyle: Int = 1
     private var playbackElapsedSeconds: Double = 0
@@ -69,6 +136,12 @@ final class NativePiPController: NSObject {
             NotificationCenter.default.removeObserver(resizeObserver)
             privatePiPPanelResizeObserver = nil
         }
+        if let observer = privatePiPDismissalCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            privatePiPDismissalCloseObserver = nil
+        }
+        privatePiPDismissalWatchdog?.invalidate()
+        privatePiPDismissalWatchdog = nil
     }
 
     func setContentView(_ view: NSView) {
@@ -90,7 +163,6 @@ final class NativePiPController: NSObject {
 
     func requestStart() {
         setupIfNeeded()
-        suppressPlaybackCommands = false
         wantsStart = true
         attemptStartPiP()
     }
@@ -118,16 +190,46 @@ final class NativePiPController: NSObject {
         isStartingPictureInPicture = false
         isPiPContentReady = false
 
-        guard privatePiPPresented else { return }
-
-        isStoppingPrivatePiPProgrammatically = true
-        handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: false)
-
-        if let privatePiPController {
-            _ = dismissPrivatePictureInPicture(on: privatePiPController)
+        guard privatePiPPresented,
+              let presentationEpoch = presentationEpochs.current
+        else {
+            presentationEpochs.cancel()
+            return
         }
 
-        isStoppingPrivatePiPProgrammatically = false
+        guard presentationEpochs.beginDismissal(presentationEpoch) else {
+            return
+        }
+        beginProgrammaticDismissalObservation(
+            panel: privatePiPPanel ?? currentPrivatePiPPanel(),
+            presentationEpoch: presentationEpoch
+        )
+
+        handlePrivatePiPStateDidChange(
+            isPresented: false,
+            notifyExternalClose: false,
+            expectedPresentationEpoch: presentationEpoch
+        )
+
+        if let privatePiPController {
+            let dismissalMechanism = dismissPrivatePictureInPicture(
+                on: privatePiPController,
+                presentationEpoch: presentationEpoch
+            )
+            configureProgrammaticDismissal(
+                mechanism: dismissalMechanism,
+                presentationEpoch: presentationEpoch
+            )
+            if dismissalMechanism == .unavailable {
+                recoverFromStalledProgrammaticDismissal(
+                    presentationEpoch: presentationEpoch
+                )
+            }
+        } else {
+            recoverFromStalledProgrammaticDismissal(
+                presentationEpoch: presentationEpoch
+            )
+        }
     }
 
     func updateExpectedVideoSize(_ size: CGSize) {
@@ -181,7 +283,9 @@ final class NativePiPController: NSObject {
         setupPrivatePiPHostView()
 
         if !setupPrivatePiPController() {
-            print("[Float PiP] Failed to initialize private PiP controller")
+            FloatLog.pictureInPicture.error(
+                "Failed to initialize private PiP controller"
+            )
         }
     }
 
@@ -257,7 +361,10 @@ final class NativePiPController: NSObject {
         if let effectiveControls = callUInt64Getter(on: controller, selectorName: "controls"),
            let effectiveStyle = callIntGetter(on: controller, selectorName: "controlStyle")
         {
-            print("[Float PiP] controls configured default=\(defaultControls) requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle) defaultStyle=\(defaultStyle)")
+            FloatLog.debug(
+                FloatLog.pictureInPicture,
+                "controls.configured default=\(defaultControls) requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle) defaultStyle=\(defaultStyle)"
+            )
         }
         controller.addObserver(self, forKeyPath: "playing", options: [.new], context: &privatePiPPlayingKVOContext)
         isObservingPrivatePiPPlaying = true
@@ -279,20 +386,29 @@ final class NativePiPController: NSObject {
             _ = dlerror()
             guard dlopen(path, RTLD_NOW | RTLD_GLOBAL) != nil else {
                 if let errorPointer = dlerror() {
-                    print("[Float PiP] dlopen failed path=\(path) error=\(String(cString: errorPointer))")
+                    FloatLog.debug(
+                        FloatLog.pictureInPicture,
+                        "framework.load.failed path=\(path) error=\(String(cString: errorPointer))"
+                    )
                 } else {
-                    print("[Float PiP] dlopen failed path=\(path)")
+                    FloatLog.debug(
+                        FloatLog.pictureInPicture,
+                        "framework.load.failed path=\(path)"
+                    )
                 }
                 continue
             }
 
             if let pipClass = NSClassFromString("PIPViewController") as? NSObject.Type {
-                print("[Float PiP] loaded private framework path=\(path)")
+                FloatLog.debug(
+                    FloatLog.pictureInPicture,
+                    "framework.loaded path=\(path)"
+                )
                 return pipClass
             }
         }
 
-        print("[Float PiP] PIPViewController class unavailable")
+        FloatLog.pictureInPicture.error("PIPViewController class unavailable")
         return nil
     }
 
@@ -308,7 +424,10 @@ final class NativePiPController: NSObject {
 
         let clientConforms = NSProtocolFromString("PIPClientXPCProtocol").map { class_conformsToProtocol(cls, $0) } ?? false
         let legacyConforms = NSProtocolFromString("PIPViewControllerDelegate").map { class_conformsToProtocol(cls, $0) } ?? false
-        print("[Float PiP] delegate conformance client=\(clientConforms) legacy=\(legacyConforms)")
+        FloatLog.debug(
+            FloatLog.pictureInPicture,
+            "delegate.conformance client=\(clientConforms) legacy=\(legacyConforms)"
+        )
 
         for selectorName in [
             "clientPIP:setPlaying:",
@@ -319,7 +438,10 @@ final class NativePiPController: NSObject {
             "pipActionStop:",
         ] {
             let responds = responds(to: NSSelectorFromString(selectorName))
-            print("[Float PiP] delegate responds \(selectorName)=\(responds)")
+            FloatLog.debug(
+                FloatLog.pictureInPicture,
+                "delegate.selector name=\(selectorName) responds=\(responds)"
+            )
         }
     }
 
@@ -328,6 +450,7 @@ final class NativePiPController: NSObject {
         guard isPiPContentReady else { return }
         guard !privatePiPPresented else { return }
         guard !isStartingPictureInPicture else { return }
+        guard presentationEpochs.canBeginPresentation else { return }
         guard let privatePiPController else { return }
 
         let selectorName = "presentViewControllerAsPictureInPicture:"
@@ -345,6 +468,9 @@ final class NativePiPController: NSObject {
         isStartingPictureInPicture = false
 
         guard didPresent else { return }
+        guard let presentationEpoch = presentationEpochs.begin() else {
+            return
+        }
         applyPrivatePiPControlsConfiguration()
         _ = updatePrivatePlaybackState(on: privatePiPController, isPlaying: playbackIsPlaying)
         callBoolSetter(on: privatePiPController, selectorName: "setPlaying:", value: playbackIsPlaying)
@@ -352,8 +478,12 @@ final class NativePiPController: NSObject {
         if let effectiveControls = callUInt64Getter(on: privatePiPController, selectorName: "controls"),
            let effectiveStyle = callIntGetter(on: privatePiPController, selectorName: "controlStyle")
         {
-            print("[Float PiP] controls after present requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle)")
+            FloatLog.debug(
+                FloatLog.pictureInPicture,
+                "controls.presented requested=\(defaultPrivatePiPControls) effective=\(effectiveControls) style=\(effectiveStyle)"
+            )
         }
+        onPictureInPictureStarted?(presentationEpoch)
         handlePrivatePiPStateDidChange(isPresented: true, notifyExternalClose: false)
     }
 
@@ -576,6 +706,7 @@ final class NativePiPController: NSObject {
     }
 
     private func forwardSeekCommand(interval: Double) {
+        guard !suppressPlaybackCommands else { return }
         guard interval.isFinite else { return }
 
         playbackElapsedSeconds = clampElapsedTime(currentPlaybackElapsedSeconds() + interval)
@@ -593,31 +724,251 @@ final class NativePiPController: NSObject {
         let elapsed = callDoubleGetter(on: state, selectorName: "elapsedTime") ?? -1
         let rate = callDoubleGetter(on: state, selectorName: "playbackRate") ?? -1
         let timeControlStatus = callIntGetter(on: state, selectorName: "timeControlStatus") ?? -1
-        print("\(prefix) contentType=\(contentType) duration=\(duration) elapsed=\(elapsed) rate=\(rate) status=\(timeControlStatus)")
+        FloatLog.debug(
+            FloatLog.pictureInPicture,
+            "\(prefix) contentType=\(contentType) duration=\(duration) elapsed=\(elapsed) rate=\(rate) status=\(timeControlStatus)"
+        )
     }
 
-    private func dismissPrivatePictureInPicture(on controller: NSObject) -> Bool {
-        if callVoidMethod(on: controller, selectorName: "dismissPictureInPicture") {
-            return true
+    private func dismissPrivatePictureInPicture(
+        on controller: NSObject,
+        presentationEpoch: UInt64
+    ) -> PiPDismissalMechanism {
+        let completion: @convention(block) () -> Void = { [weak self] in
+            Task { @MainActor [weak self] in
+                self?.markProgrammaticDismissalControllerCompleted(
+                    presentationEpoch: presentationEpoch
+                )
+            }
         }
-        if callVoidMethod(on: controller, selectorName: "stopPictureInPicture") {
-            return true
-        }
-        let completion: @convention(block) () -> Void = {}
         if callObjectSetter(
             on: controller,
             selectorName: "dismissPictureInPictureWithCompletionHandler:",
             value: unsafeBitCast(completion, to: AnyObject.self)
         ) {
-            return true
+            return .completionHandler
         }
-        return false
+        if callVoidMethod(on: controller, selectorName: "dismissPictureInPicture") {
+            return .legacy
+        }
+        if callVoidMethod(on: controller, selectorName: "stopPictureInPicture") {
+            return .legacy
+        }
+        return .unavailable
     }
 
-    private func handlePrivatePiPStateDidChange(isPresented: Bool, notifyExternalClose: Bool) {
+    private func beginProgrammaticDismissalObservation(
+        panel: NSWindow?,
+        presentationEpoch: UInt64
+    ) {
+        stopProgrammaticDismissalObservation()
+        privatePiPDismissalPanel = panel
+        privatePiPDismissalControllerCompleted = false
+        privatePiPDismissalPanelWillClose = false
+        privatePiPDismissalRequiresControllerCompletion = true
+        privatePiPDismissalDeadline = Date().addingTimeInterval(
+            Constants.dismissalTimeout
+        )
+
+        if let panel {
+            privatePiPDismissalCloseObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.willCloseNotification,
+                object: panel,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.markProgrammaticDismissalPanelWillClose(
+                        presentationEpoch: presentationEpoch
+                    )
+                }
+            }
+        }
+
+        privatePiPDismissalWatchdog = Timer.scheduledTimer(
+            withTimeInterval: Constants.dismissalWatchdogInterval,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.checkProgrammaticDismissal(
+                    presentationEpoch: presentationEpoch
+                )
+            }
+        }
+    }
+
+    private func stopProgrammaticDismissalObservation() {
+        if let observer = privatePiPDismissalCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            privatePiPDismissalCloseObserver = nil
+        }
+        privatePiPDismissalWatchdog?.invalidate()
+        privatePiPDismissalWatchdog = nil
+        privatePiPDismissalPanel = nil
+        privatePiPDismissalControllerCompleted = false
+        privatePiPDismissalPanelWillClose = false
+        privatePiPDismissalRequiresControllerCompletion = true
+        privatePiPDismissalDeadline = nil
+    }
+
+    private func configureProgrammaticDismissal(
+        mechanism: PiPDismissalMechanism,
+        presentationEpoch: UInt64
+    ) {
+        guard presentationEpochs.isDismissing(presentationEpoch) else {
+            return
+        }
+        privatePiPDismissalRequiresControllerCompletion =
+            mechanism == .completionHandler
+        checkProgrammaticDismissal(presentationEpoch: presentationEpoch)
+    }
+
+    private func markProgrammaticDismissalControllerCompleted(
+        presentationEpoch: UInt64
+    ) {
+        guard presentationEpochs.isDismissing(presentationEpoch) else {
+            return
+        }
+        privatePiPDismissalControllerCompleted = true
+        checkProgrammaticDismissal(presentationEpoch: presentationEpoch)
+    }
+
+    private func markProgrammaticDismissalPanelWillClose(
+        presentationEpoch: UInt64
+    ) {
+        guard presentationEpochs.isDismissing(presentationEpoch) else {
+            return
+        }
+        privatePiPDismissalPanelWillClose = true
+        checkProgrammaticDismissal(presentationEpoch: presentationEpoch)
+    }
+
+    private func checkProgrammaticDismissal(
+        presentationEpoch: UInt64
+    ) {
+        guard presentationEpochs.isDismissing(presentationEpoch) else {
+            return
+        }
+
+        if let deadline = privatePiPDismissalDeadline,
+           Date() >= deadline
+        {
+            recoverFromStalledProgrammaticDismissal(
+                presentationEpoch: presentationEpoch
+            )
+            return
+        }
+
+        let controllerDismissalFinished =
+            !privatePiPDismissalRequiresControllerCompletion ||
+            privatePiPDismissalControllerCompleted
+        guard controllerDismissalFinished else {
+            return
+        }
+
+        if let dismissedPanel = privatePiPDismissalPanel {
+            let currentPanel = currentPrivatePiPPanel()
+            let panelDismissalFinished =
+                currentPanel !== dismissedPanel ||
+                (privatePiPDismissalRequiresControllerCompletion &&
+                    privatePiPDismissalControllerCompleted &&
+                    (privatePiPDismissalPanelWillClose ||
+                        !dismissedPanel.isVisible))
+            guard panelDismissalFinished else {
+                return
+            }
+            completeProgrammaticDismissal(
+                presentationEpoch: presentationEpoch
+            )
+            return
+        }
+
+        if privatePiPDismissalControllerCompleted ||
+            currentPrivatePiPPanel() == nil
+        {
+            completeProgrammaticDismissal(
+                presentationEpoch: presentationEpoch
+            )
+        }
+    }
+
+    private func recoverFromStalledProgrammaticDismissal(
+        presentationEpoch: UInt64
+    ) {
+        guard presentationEpochs.isDismissing(presentationEpoch) else {
+            return
+        }
+
+        let dismissedPanel = privatePiPDismissalPanel
+        stopProgrammaticDismissalObservation()
+        stopPrivatePiPVisibilityWatchdog()
+        stopPrivatePiPPanelObservation()
+
+        if isObservingPrivatePiPPlaying,
+           let controller = privatePiPController
+        {
+            controller.removeObserver(
+                self,
+                forKeyPath: "playing",
+                context: &privatePiPPlayingKVOContext
+            )
+            isObservingPrivatePiPPlaying = false
+            callObjectSetter(
+                on: controller,
+                selectorName: "setDelegate:",
+                value: nil
+            )
+        }
+
+        privatePiPController = nil
+        dismissedPanel?.orderOut(nil)
+        dismissedPanel?.close()
+
+        // The old private controller may retain its content view controller.
+        // Move the host view to a fresh wrapper before creating the replacement.
+        privatePiPContentViewController.view = NSView()
+        privatePiPContentViewController = NSViewController()
+        privatePiPContentViewController.view = hostView
+        _ = setupPrivatePiPController()
+
+        guard presentationEpochs.completeDismissal(presentationEpoch) else {
+            return
+        }
+        queueStartAfterProgrammaticDismissal()
+    }
+
+    private func completeProgrammaticDismissal(
+        presentationEpoch: UInt64
+    ) {
+        guard presentationEpochs.completeDismissal(presentationEpoch) else {
+            return
+        }
+        stopProgrammaticDismissalObservation()
+        queueStartAfterProgrammaticDismissal()
+    }
+
+    private func queueStartAfterProgrammaticDismissal() {
+        // Let the private controller finish its close notification before a
+        // queued replacement presentation is attempted.
+        DispatchQueue.main.async { [weak self] in
+            self?.attemptStartPiP()
+        }
+    }
+
+    private func handlePrivatePiPStateDidChange(
+        isPresented: Bool,
+        notifyExternalClose: Bool,
+        expectedPresentationEpoch: UInt64? = nil
+    ) {
+        if let expectedPresentationEpoch,
+           !presentationEpochs.matches(expectedPresentationEpoch)
+        {
+            return
+        }
+
         privatePiPPresented = isPresented
 
         if isPresented {
+            guard presentationEpochs.current != nil else { return }
             suppressPlaybackCommands = false
             startPrivatePiPPanelObservation()
             startPrivatePiPVisibilityWatchdog()
@@ -625,11 +976,18 @@ final class NativePiPController: NSObject {
             return
         }
 
+        let closedPresentationEpoch = presentationEpochs.current
+        if let closedPresentationEpoch {
+            _ = presentationEpochs.end(closedPresentationEpoch)
+        }
+        if notifyExternalClose {
+            wantsStart = false
+        }
         suppressPlaybackCommands = true
         stopPrivatePiPVisibilityWatchdog()
         stopPrivatePiPPanelObservation()
-        if notifyExternalClose {
-            onPictureInPictureClosed?()
+        if notifyExternalClose, let closedPresentationEpoch {
+            onPictureInPictureClosed?(closedPresentationEpoch)
         }
     }
 
@@ -673,18 +1031,30 @@ final class NativePiPController: NSObject {
     }
 
     private func checkPrivatePiPVisibility() {
-        guard privatePiPPresented else { return }
+        guard privatePiPPresented,
+              let presentationEpoch = presentationEpochs.current
+        else {
+            return
+        }
 
         let panel = currentPrivatePiPPanel()
         updateObservedPrivatePiPPanel(panel)
 
         guard let panel else {
-            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
+            handlePrivatePiPStateDidChange(
+                isPresented: false,
+                notifyExternalClose: true,
+                expectedPresentationEpoch: presentationEpoch
+            )
             return
         }
 
         guard panel.isVisible else {
-            handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
+            handlePrivatePiPStateDidChange(
+                isPresented: false,
+                notifyExternalClose: true,
+                expectedPresentationEpoch: presentationEpoch
+            )
             return
         }
 
@@ -702,7 +1072,11 @@ final class NativePiPController: NSObject {
         removePrivatePiPPanelObservers()
 
         privatePiPPanel = panel
-        guard let panel else { return }
+        guard let panel,
+              let presentationEpoch = presentationEpochs.current
+        else {
+            return
+        }
 
         // Keep the private PiP panel available across spaces/fullscreen workflows.
         panel.collectionBehavior.insert(.canJoinAllSpaces)
@@ -712,9 +1086,13 @@ final class NativePiPController: NSObject {
             forName: NSWindow.willCloseNotification,
             object: panel,
             queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handlePrivatePiPPanelWillClose()
+        ) { [weak self, panel] _ in
+            Task { @MainActor [weak self, panel] in
+                guard let self else { return }
+                self.handlePrivatePiPPanelWillClose(
+                    panel: panel,
+                    presentationEpoch: presentationEpoch
+                )
             }
         }
 
@@ -722,24 +1100,47 @@ final class NativePiPController: NSObject {
             forName: NSWindow.didResizeNotification,
             object: panel,
             queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.handlePrivatePiPPanelDidResize()
+        ) { [weak self, panel] _ in
+            Task { @MainActor [weak self, panel] in
+                guard let self else { return }
+                self.handlePrivatePiPPanelDidResize(
+                    panel: panel,
+                    presentationEpoch: presentationEpoch
+                )
             }
         }
 
         maybeNotifyPiPRenderSizeChanged(for: panel)
     }
 
-    private func handlePrivatePiPPanelWillClose() {
-        guard privatePiPPresented else { return }
+    private func handlePrivatePiPPanelWillClose(
+        panel: NSWindow,
+        presentationEpoch: UInt64
+    ) {
+        guard privatePiPPresented,
+              privatePiPPanel === panel,
+              presentationEpochs.matches(presentationEpoch)
+        else {
+            return
+        }
 
-        handlePrivatePiPStateDidChange(isPresented: false, notifyExternalClose: shouldNotifyExternalClose)
+        handlePrivatePiPStateDidChange(
+            isPresented: false,
+            notifyExternalClose: true,
+            expectedPresentationEpoch: presentationEpoch
+        )
     }
 
-    private func handlePrivatePiPPanelDidResize() {
-        guard privatePiPPresented else { return }
-        guard let panel = privatePiPPanel else { return }
+    private func handlePrivatePiPPanelDidResize(
+        panel: NSWindow,
+        presentationEpoch: UInt64
+    ) {
+        guard privatePiPPresented,
+              privatePiPPanel === panel,
+              presentationEpochs.matches(presentationEpoch)
+        else {
+            return
+        }
         maybeNotifyPiPRenderSizeChanged(for: panel)
     }
 
@@ -805,7 +1206,10 @@ final class NativePiPController: NSObject {
         case 2:
             forwardPlaybackCommand(isPlaying: false)
         default:
-            print("[Float PiP] unhandled action=\(action)")
+            FloatLog.debug(
+                FloatLog.pictureInPicture,
+                "playback.unhandled-action value=\(action)"
+            )
         }
     }
 
@@ -865,10 +1269,6 @@ final class NativePiPController: NSObject {
         updatePlaybackClock(isPlaying: isPlaying)
         pushPlaybackStateToPiPController()
         onPlaybackCommand?(isPlaying)
-    }
-
-    private var shouldNotifyExternalClose: Bool {
-        !isStoppingPrivatePiPProgrammatically
     }
 
     private func removePrivatePiPPanelObservers() {
