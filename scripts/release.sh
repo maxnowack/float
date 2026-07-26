@@ -4,6 +4,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE="origin"
 COMPANION_CONFIGURATION="Release"
+NOTARY_PROFILE=""
+SIGNING_IDENTITY=""
 TAG=""
 TITLE=""
 PRERELEASE=0
@@ -19,7 +21,8 @@ Options:
   --tag <tag>                 Git tag to create (required), e.g. v0.2.0
   --title <title>             GitHub release title (default: tag value)
   --remote <remote>           Git remote to push tag to (default: origin)
-  --config <Debug|Release>    Companion build configuration (default: Release)
+  --notary-profile <profile>  notarytool Keychain profile (required)
+  --signing-identity <name>   Developer ID Application identity (required)
   --prerelease                Mark GitHub release as prerelease
   --draft                     Create GitHub release as draft
   --yes                       Skip confirmation prompt
@@ -29,10 +32,12 @@ What this script does:
   1. Verifies the working tree is clean.
   2. Bumps extension + companion versions from --tag and increments build number.
   3. Creates a version-bump commit.
-  4. Builds and packages extension + companion artifacts.
-  5. Creates and pushes a new annotated git tag.
-  6. Creates a GitHub release for that tag via gh CLI.
-  7. Uploads packaged artifacts to that release.
+  4. Builds a Developer ID signed Release companion.
+  5. Verifies signatures, Team IDs, Hardened Runtime, and entitlements.
+  6. Notarizes and staples each companion app, then passes Gatekeeper.
+  7. Packages artifacts and creates a SHA-256 manifest.
+  8. Only then pushes the branch and annotated tag.
+  9. Creates a GitHub release and uploads the verified artifacts.
 EOF
 }
 
@@ -117,9 +122,14 @@ while [[ $# -gt 0 ]]; do
       REMOTE="$2"
       shift 2
       ;;
-    --config)
-      [[ $# -ge 2 ]] || die "--config requires a value"
-      COMPANION_CONFIGURATION="$2"
+    --notary-profile)
+      [[ $# -ge 2 ]] || die "--notary-profile requires a value"
+      NOTARY_PROFILE="$2"
+      shift 2
+      ;;
+    --signing-identity)
+      [[ $# -ge 2 ]] || die "--signing-identity requires a value"
+      SIGNING_IDENTITY="$2"
       shift 2
       ;;
     --prerelease)
@@ -149,11 +159,11 @@ done
   die "--tag is required"
 }
 
-case "$COMPANION_CONFIGURATION" in
-  Debug|Release) ;;
-  *)
-    die "--config must be Debug or Release (got: $COMPANION_CONFIGURATION)"
-    ;;
+[[ -n "$NOTARY_PROFILE" ]] || die "--notary-profile is required"
+[[ -n "$SIGNING_IDENTITY" ]] || die "--signing-identity is required"
+case "$SIGNING_IDENTITY" in
+  "Developer ID Application:"*) ;;
+  *) die "--signing-identity must name a Developer ID Application identity" ;;
 esac
 
 if [[ -z "$TITLE" ]]; then
@@ -165,6 +175,8 @@ need_cmd gh
 need_cmd node
 need_cmd perl
 need_cmd rg
+need_cmd shasum
+need_cmd xcrun
 
 cd "$ROOT_DIR"
 
@@ -191,7 +203,7 @@ echo "Tag: $TAG"
 echo "Version: $VERSION"
 echo "Companion build number: $BUILD_NUMBER"
 echo "Remote: $REMOTE"
-echo "Companion config: $COMPANION_CONFIGURATION"
+echo "Companion config: Release (signed, notarized, and stapled)"
 
 if [[ "$SKIP_CONFIRM" -ne 1 ]]; then
   read -r -p "Continue? [y/N] " reply
@@ -216,17 +228,32 @@ fi
 git commit -m "chore(release): bump version to $VERSION ($BUILD_NUMBER)"
 
 # Avoid stale uploads from prior runs.
-rm -f "$ROOT_DIR"/artifacts/*.zip 2>/dev/null || true
+rm -f \
+  "$ROOT_DIR"/artifacts/*.zip \
+  "$ROOT_DIR"/artifacts/SHA256SUMS.txt \
+  2>/dev/null || true
 
-"$ROOT_DIR/scripts/pack-all.sh" "$COMPANION_CONFIGURATION"
+FLOAT_NOTARY_PROFILE="$NOTARY_PROFILE" \
+FLOAT_CODE_SIGN_IDENTITY="$SIGNING_IDENTITY" \
+  "$ROOT_DIR/scripts/pack-all.sh" "$COMPANION_CONFIGURATION"
 
-mapfile -t ARTIFACTS < <(
+ARTIFACTS=()
+while IFS= read -r artifact; do
+  ARTIFACTS+=("$artifact")
+done < <(
   find "$ROOT_DIR/artifacts" -maxdepth 1 -type f -name '*.zip' 2>/dev/null | sort
 )
 
 if [[ "${#ARTIFACTS[@]}" -eq 0 ]]; then
   die "no packaged artifacts found under artifacts/"
 fi
+
+(
+  cd "$ROOT_DIR/artifacts"
+  "$ROOT_DIR/scripts/hash-artifacts.sh" ./*.zip > SHA256SUMS.txt
+  shasum -a 256 -c SHA256SUMS.txt
+)
+ARTIFACTS+=("$ROOT_DIR/artifacts/SHA256SUMS.txt")
 
 echo "Artifacts:"
 for artifact in "${ARTIFACTS[@]}"; do

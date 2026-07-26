@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Float pairing</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <img src="icons/icon48.png" alt="" width="32" height="32" />
+        <div>
+          <h1>Float</h1>
+          <p id="status" class="status disconnected">Disconnected</p>
+        </div>
+      </header>
+
+      <p class="instructions">
+        In the Float menu bar menu, choose
+        <strong>Copy Sensitive Pairing Secret</strong>, then paste it here.
+        Float clears an unchanged clipboard after pairing or 60 seconds.
+      </p>
+
+      <form id="pairing-form">
+        <label for="pairing-secret">Pairing secret</label>
+        <input
+          id="pairing-secret"
+          name="pairing-secret"
+          type="password"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="Paste the 43-character secret"
+        />
+        <p id="validation" class="validation" role="alert"></p>
+        <button id="save" type="submit">Pair with Float</button>
+      </form>
+
+      <button id="remove" class="secondary" type="button" hidden>
+        Remove pairing
+      </button>
+    </main>
+    <script src="dist/security.js"></script>
+    <script src="dist/popup.js"></script>
+  </body>
+</html>

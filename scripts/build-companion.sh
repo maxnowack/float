@@ -6,6 +6,9 @@ PROJECT_PATH="$ROOT_DIR/companion/Float.xcodeproj"
 SCHEME="Float"
 CONFIGURATION="${1:-Release}"
 ARCHITECTURE="${2:-}"
+DERIVED_DATA_PATH="${FLOAT_DERIVED_DATA_PATH:-$ROOT_DIR/.xcodebuild/${CONFIGURATION}-${ARCHITECTURE:-native}}"
+UNSIGNED="${FLOAT_UNSIGNED:-0}"
+SIGNING_IDENTITY="${FLOAT_CODE_SIGN_IDENTITY:-}"
 
 case "$CONFIGURATION" in
   Debug|Release)
@@ -26,6 +29,7 @@ XCODEBUILD_ARGS=(
   -scheme "$SCHEME"
   -configuration "$CONFIGURATION"
   -sdk macosx
+  -derivedDataPath "$DERIVED_DATA_PATH"
 )
 
 if [[ -n "$ARCHITECTURE" ]]; then
@@ -36,7 +40,26 @@ if [[ -n "$ARCHITECTURE" ]]; then
       exit 1
       ;;
   esac
-  XCODEBUILD_ARGS+=(-arch "$ARCHITECTURE")
+  XCODEBUILD_ARGS+=(
+    -destination "generic/platform=macOS"
+    "ARCHS=$ARCHITECTURE"
+    ONLY_ACTIVE_ARCH=NO
+  )
+fi
+
+if [[ "$UNSIGNED" == "1" ]]; then
+  if [[ -n "$SIGNING_IDENTITY" ]]; then
+    echo "error: FLOAT_UNSIGNED and FLOAT_CODE_SIGN_IDENTITY cannot be used together." >&2
+    exit 1
+  fi
+  XCODEBUILD_ARGS+=(CODE_SIGNING_ALLOWED=NO)
+elif [[ "$UNSIGNED" != "0" ]]; then
+  echo "error: FLOAT_UNSIGNED must be 0 or 1 (got: $UNSIGNED)." >&2
+  exit 1
+fi
+
+if [[ -n "$SIGNING_IDENTITY" ]]; then
+  XCODEBUILD_ARGS+=("CODE_SIGN_IDENTITY=$SIGNING_IDENTITY")
 fi
 
 xcodebuild "${XCODEBUILD_ARGS[@]}" build

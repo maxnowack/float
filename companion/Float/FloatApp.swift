@@ -98,7 +98,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
     }
 
     private func startFloating(_ source: SignalingServer.VideoSource) {
-        signalingServer.requestStart(tabId: source.tabId, videoId: source.videoId)
+        signalingServer.requestStart(source)
     }
 
     private func presentSourceMenu(_ sources: [SignalingServer.VideoSource]) {
@@ -163,6 +163,32 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
 
         menu.addItem(.separator())
 
+        let statusItem = NSMenuItem(
+            title: signalingServer.stateDescription(),
+            action: nil,
+            keyEquivalent: ""
+        )
+        statusItem.isEnabled = false
+        menu.addItem(statusItem)
+
+        let copyPairingItem = NSMenuItem(
+            title: "Copy Sensitive Pairing Secret",
+            action: #selector(handleCopyPairingSecret),
+            keyEquivalent: ""
+        )
+        copyPairingItem.target = self
+        menu.addItem(copyPairingItem)
+
+        let rotatePairingItem = NSMenuItem(
+            title: "Rotate Pairing Secret…",
+            action: #selector(handleRotatePairingSecret),
+            keyEquivalent: ""
+        )
+        rotatePairingItem.target = self
+        menu.addItem(rotatePairingItem)
+
+        menu.addItem(.separator())
+
         let quitItem = NSMenuItem(title: "Quit Float", action: #selector(handleQuit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
@@ -210,6 +236,49 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         let enabled = sender.state != .on
         signalingServer.setDiagnosticsOverlayEnabled(enabled)
         sender.state = enabled ? .on : .off
+    }
+
+    @objc private func handleCopyPairingSecret() {
+        do {
+            let value = try signalingServer.pairingCredentialForDisplay()
+            guard SensitivePasteboard.copy(value) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+        } catch {
+            presentPairingError(error)
+        }
+    }
+
+    @objc private func handleRotatePairingSecret() {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Rotate Float pairing secret?"
+        alert.informativeText =
+            "All connected extensions will be disconnected. The new sensitive secret will remain on the clipboard for at most 60 seconds."
+        alert.addButton(withTitle: "Rotate")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+
+        do {
+            let value = try signalingServer.rotatePairingCredential()
+            guard SensitivePasteboard.copy(value) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+
+            let completed = NSAlert()
+            completed.messageText = "Pairing secret rotated"
+            completed.informativeText =
+                "Paste the new secret into each Float extension. Float clears it after successful pairing or 60 seconds if the clipboard remains unchanged."
+            completed.runModal()
+        } catch {
+            presentPairingError(error)
+        }
+    }
+
+    private func presentPairingError(_ error: Error) {
+        let alert = NSAlert(error: error)
+        alert.messageText = "Float pairing failed"
+        alert.runModal()
     }
 
     func menuDidClose(_ menu: NSMenu) {

@@ -1,7 +1,74 @@
-#if canImport(WebRTC)
+#if canImport(LiveKitWebRTC)
 import AppKit
 import Foundation
-import WebRTC
+import LiveKitWebRTC
+import OSLog
+
+enum ReceiverSessionEnqueueResult: Equatable {
+    case enqueued
+    case staleSession
+    case limitReached
+}
+
+struct ReceiverSessionState<PendingCandidate> {
+    private(set) var current: UInt64?
+    private var lastIssued: UInt64 = 0
+    private var pendingCandidates: [PendingCandidate] = []
+
+    mutating func begin() -> UInt64 {
+        precondition(
+            lastIssued < UInt64.max,
+            "Receiver session epoch exhausted"
+        )
+        lastIssued += 1
+        current = lastIssued
+        pendingCandidates.removeAll()
+        return lastIssued
+    }
+
+    func matches(_ epoch: UInt64) -> Bool {
+        current == epoch
+    }
+
+    mutating func cancel() {
+        current = nil
+        pendingCandidates.removeAll()
+    }
+
+    mutating func enqueue(
+        _ candidate: PendingCandidate,
+        for epoch: UInt64,
+        limit: Int
+    ) -> ReceiverSessionEnqueueResult {
+        guard matches(epoch) else {
+            return .staleSession
+        }
+        guard pendingCandidates.count < limit else {
+            return .limitReached
+        }
+        pendingCandidates.append(candidate)
+        return .enqueued
+    }
+
+    mutating func dequeue(for epoch: UInt64) -> PendingCandidate? {
+        guard matches(epoch), !pendingCandidates.isEmpty else {
+            return nil
+        }
+        return pendingCandidates.removeFirst()
+    }
+
+    func pendingCount(for epoch: UInt64) -> Int {
+        matches(epoch) ? pendingCandidates.count : 0
+    }
+}
+
+private enum NativeReceiverSessionError: LocalizedError {
+    case superseded
+
+    var errorDescription: String? {
+        "WebRTC receiver session was superseded."
+    }
+}
 
 @MainActor
 final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
@@ -18,7 +85,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private static let opusTargetBitrateBps: Int = 256_000
     // ========================================================================
     
-    private static let terminalConnectionStates: Set<RTCPeerConnectionState> = [
+    private static let terminalConnectionStates: Set<LKRTCPeerConnectionState> = [
         .disconnected, .failed, .closed,
     ]
     private static let statsProbeIntervalSeconds: TimeInterval = 1.0
@@ -29,28 +96,39 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         let sampleTime: Date
     }
 
+    private struct PiPPresentationSource {
+        let presentationEpoch: UInt64
+        let receiverSessionEpoch: UInt64
+        let tabId: Int
+        let videoId: String
+        let generation: Int
+    }
+
     var onLocalIceCandidate: ((LocalIceCandidate) -> Void)?
-    var onStreamingChanged: ((Bool) -> Void)?
-    var onPlaybackCommand: ((Bool) -> Void)?
-    var onSeekCommand: ((Double) -> Void)?
-    var onPiPRenderSizeChanged: ((CGSize) -> Void)?
+    var onStreamingChanged: ((WebRTCMediaSource, Bool) -> Void)?
+    var onPictureInPictureClosed: ((Int, String, Int) -> Void)?
+    var onPlaybackCommand: ((WebRTCMediaSource, Bool) -> Void)?
+    var onSeekCommand: ((WebRTCMediaSource, Double) -> Void)?
+    var onPiPRenderSizeChanged: ((WebRTCMediaSource, CGSize) -> Void)?
 
     private static var didInitializeSSL = false
     private static var didInitializeFieldTrials = false
     static var isSupported: Bool {
-        RTCMTLNSVideoView.isMetalAvailable()
+        LKRTCMTLVideoView.isMetalAvailable()
     }
 
     private let pipController = NativePiPController()
-    private let peerConnectionFactory: RTCPeerConnectionFactory
-    private let videoView: RTCMTLNSVideoView
+    private let peerConnectionFactory: LKRTCPeerConnectionFactory
+    private let videoView: LKRTCMTLVideoView
 
-    private var peerConnection: RTCPeerConnection?
-    private var remoteVideoTrack: RTCVideoTrack?
-    private var remoteAudioTrack: RTCAudioTrack?
-    private var pendingRemoteCandidates: [RTCIceCandidate] = []
+    private var peerConnection: LKRTCPeerConnection?
+    private var remoteVideoTrack: LKRTCVideoTrack?
+    private var remoteAudioTrack: LKRTCAudioTrack?
+    private var receiverSessions = ReceiverSessionState<LKRTCIceCandidate>()
     private var currentTabId: Int?
     private var currentVideoId: String?
+    private var currentGeneration: Int?
+    private var activePiPPresentationSource: PiPPresentationSource?
     private var isStopping = false
     private var debugLoggingEnabled = false
     private var diagnosticsOverlayEnabled = true
@@ -67,25 +145,25 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private var audioStatsLogCount = 0
     private var lastVideoBytesReceived: Double?
     private var lastVideoStatsTime: Date?
-    private var currentConnectionState: RTCPeerConnectionState?
+    private var currentConnectionState: LKRTCPeerConnectionState?
 
     override init() {
         if !Self.didInitializeFieldTrials {
-            RTCInitFieldTrialDictionary([
-                // Avoid AEC render/capture downmix behavior that can collapse stereo channels.
-                "WebRTC-Aec3EnforceRenderDelayEstimationDownmixing": "Disabled",
-                "WebRTC-Aec3EnforceCaptureDelayEstimationDownmixing": "Disabled",
-            ])
+            // Avoid AEC render/capture downmix behavior that can collapse stereo channels.
+            LKRTCPeerConnectionFactory.configureFieldTrials(
+                "WebRTC-Aec3EnforceRenderDelayEstimationDownmixing/Disabled/"
+                    + "WebRTC-Aec3EnforceCaptureDelayEstimationDownmixing/Disabled/"
+            )
             Self.didInitializeFieldTrials = true
         }
 
         if !Self.didInitializeSSL {
-            _ = RTCInitializeSSL()
+            _ = LKRTCInitializeSSL()
             Self.didInitializeSSL = true
         }
 
-        peerConnectionFactory = RTCPeerConnectionFactory()
-        videoView = RTCMTLNSVideoView(frame: .zero)
+        peerConnectionFactory = LKRTCPeerConnectionFactory()
+        videoView = LKRTCMTLVideoView(frame: .zero)
 
         super.init()
 
@@ -94,44 +172,104 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         videoView.delegate = self
 
         pipController.setContentView(videoView)
-        pipController.onPictureInPictureClosed = { [weak self] in
-            self?.stop()
+        pipController.onPictureInPictureStarted = { [weak self] presentationEpoch in
+            guard let self,
+                  let receiverSessionEpoch = self.receiverSessions.current,
+                  self.peerConnection != nil,
+                  self.remoteVideoTrack != nil,
+                  let tabId = self.currentTabId,
+                  let videoId = self.currentVideoId,
+                  let generation = self.currentGeneration
+            else {
+                return
+            }
+            self.activePiPPresentationSource = PiPPresentationSource(
+                presentationEpoch: presentationEpoch,
+                receiverSessionEpoch: receiverSessionEpoch,
+                tabId: tabId,
+                videoId: videoId,
+                generation: generation
+            )
+        }
+        pipController.onPictureInPictureClosed = { [weak self] presentationEpoch in
+            guard let self,
+                  let source = self.activePiPPresentationSource,
+                  source.presentationEpoch == presentationEpoch,
+                  self.receiverSessions.matches(source.receiverSessionEpoch)
+            else {
+                return
+            }
+            self.activePiPPresentationSource = nil
+            self.onPictureInPictureClosed?(
+                source.tabId,
+                source.videoId,
+                source.generation
+            )
         }
         pipController.onPlaybackCommand = { [weak self] isPlaying in
-            self?.onPlaybackCommand?(isPlaying)
+            guard let self,
+                  let source = self.activePresentationMediaSource()
+            else {
+                return
+            }
+            self.onPlaybackCommand?(source, isPlaying)
         }
         pipController.onSeekCommand = { [weak self] intervalSeconds in
-            self?.onSeekCommand?(intervalSeconds)
+            guard let self,
+                  let source = self.activePresentationMediaSource()
+            else {
+                return
+            }
+            self.onSeekCommand?(source, intervalSeconds)
         }
         pipController.onPiPRenderSizeChanged = { [weak self] size in
-            self?.onPiPRenderSizeChanged?(size)
+            guard let self,
+                  let source = self.activePresentationMediaSource()
+            else {
+                return
+            }
+            self.onPiPRenderSizeChanged?(source, size)
         }
     }
 
     func handleOffer(_ offer: OfferMessage) async throws -> String {
         info("offer.received tabId=\(offer.tabId) videoId=\(offer.videoId) sdpLength=\(offer.sdp.count)")
-        currentTabId = offer.tabId
-        currentVideoId = offer.videoId
+        activePiPPresentationSource = nil
         pipController.setPiPContentReady(false)
 
         pipController.stop()
         clearActivePeerConnection(notifyStreamingStopped: false)
 
+        currentTabId = offer.tabId
+        currentVideoId = offer.videoId
+        currentGeneration = offer.generation
         let connection = try makePeerConnection()
+        let receiverSessionEpoch = receiverSessions.begin()
         peerConnection = connection
 
         do {
-            let remoteOffer = RTCSessionDescription(type: .offer, sdp: offer.sdp)
+            let remoteOffer = LKRTCSessionDescription(type: .offer, sdp: offer.sdp)
             try await setRemoteDescription(remoteOffer, on: connection)
+            try requireActiveReceiverSession(receiverSessionEpoch, connection: connection)
             info("offer.remoteDescription.applied")
-            try await flushPendingRemoteCandidates(on: connection)
+            try await flushPendingRemoteCandidates(
+                on: connection,
+                receiverSessionEpoch: receiverSessionEpoch
+            )
+            try requireActiveReceiverSession(receiverSessionEpoch, connection: connection)
 
             let createdAnswer = try await createAnswer(on: connection)
-            let localAnswer = RTCSessionDescription(type: .answer, sdp: createdAnswer.sdp)
+            try requireActiveReceiverSession(receiverSessionEpoch, connection: connection)
+            let localAnswer = LKRTCSessionDescription(type: .answer, sdp: createdAnswer.sdp)
             try await setLocalDescription(localAnswer, on: connection)
+            try requireActiveReceiverSession(receiverSessionEpoch, connection: connection)
             info("answer.localDescription.applied sdpLength=\(createdAnswer.sdp.count)")
 
-            try await flushPendingRemoteCandidates(on: connection)
+            try await flushPendingRemoteCandidates(
+                on: connection,
+                receiverSessionEpoch: receiverSessionEpoch
+            )
+            try requireActiveReceiverSession(receiverSessionEpoch, connection: connection)
 
             let outboundAnswerSdp = connection.localDescription?.sdp ?? createdAnswer.sdp
             logCurrentAudioReceiverParameters(context: "answer.created")
@@ -139,8 +277,13 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             return outboundAnswerSdp
         } catch {
             let reason = error.localizedDescription
-            print("[Float NativeRTC] receiver.error failed to process offer: \(reason)")
-            clearActivePeerConnection(notifyStreamingStopped: true)
+            FloatLog.media.error("Failed to process a WebRTC offer")
+            FloatLog.debug(FloatLog.media, "offer.error reason=\(reason)")
+            if ownsReceiverSession(receiverSessionEpoch, connection: connection) {
+                clearActivePeerConnection(notifyStreamingStopped: true)
+            } else {
+                disposeSupersededConnection(connection)
+            }
             throw error
         }
     }
@@ -151,21 +294,45 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             log("webrtc.ice.remote.skip reason=empty-candidate")
             return
         }
+        guard let receiverSessionEpoch = receiverSessions.current,
+              let connection = peerConnection
+        else {
+            throw WebRTCReceiverError.missingPeerConnection
+        }
+
         remoteIceCandidateCount += 1
         info("webrtc.ice.remote.received count=\(remoteIceCandidateCount) mid=\(ice.sdpMid ?? "nil") mline=\(ice.sdpMLineIndex ?? -1)")
 
-        let candidate = RTCIceCandidate(
+        let candidate = LKRTCIceCandidate(
             sdp: rawCandidate,
             sdpMLineIndex: Int32(ice.sdpMLineIndex ?? 0),
             sdpMid: ice.sdpMid
         )
 
-        guard let connection = peerConnection, connection.remoteDescription != nil else {
-            queueRemoteCandidate(candidate)
+        guard connection.remoteDescription != nil else {
+            try queueRemoteCandidate(
+                candidate,
+                receiverSessionEpoch: receiverSessionEpoch
+            )
             return
         }
 
-        try await addIceCandidate(candidate, to: connection)
+        do {
+            try await addIceCandidate(candidate, to: connection)
+        } catch {
+            guard ownsReceiverSession(
+                receiverSessionEpoch,
+                connection: connection
+            ), !Task.isCancelled else {
+                return
+            }
+            throw error
+        }
+        guard ownsReceiverSession(receiverSessionEpoch, connection: connection),
+              !Task.isCancelled
+        else {
+            return
+        }
     }
 
     func stop() {
@@ -173,7 +340,6 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         isStopping = true
         defer { isStopping = false }
 
-        resetActiveSource()
         clearActivePeerConnection(notifyStreamingStopped: true)
         pipController.stop()
     }
@@ -211,8 +377,8 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
     }
 
-    private func makePeerConnection() throws -> RTCPeerConnection {
-        let configuration = RTCConfiguration()
+    private func makePeerConnection() throws -> LKRTCPeerConnection {
+        let configuration = LKRTCConfiguration()
         configuration.iceServers = []
         configuration.sdpSemantics = .unifiedPlan
         configuration.continualGatheringPolicy = .gatherOnce
@@ -232,9 +398,11 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func clearActivePeerConnection(notifyStreamingStopped: Bool) {
+        let stoppedSource = currentMediaSource()
+        receiverSessions.cancel()
+        activePiPPresentationSource = nil
         pipController.setPiPContentReady(false)
         stopStatsProbe()
-        pendingRemoteCandidates.removeAll()
         lastVideoInboundSnapshot = nil
         smoothedVideoFPS = nil
         lastReportedVideoSize = .zero
@@ -260,12 +428,13 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             peerConnection = nil
         }
 
-        if notifyStreamingStopped {
-            onStreamingChanged?(false)
+        resetActiveSource()
+        if notifyStreamingStopped, let stoppedSource {
+            onStreamingChanged?(stoppedSource, false)
         }
     }
 
-    private func attachRemoteVideoTrack(_ track: RTCVideoTrack) {
+    private func attachRemoteVideoTrack(_ track: LKRTCVideoTrack) {
         if let existing = remoteVideoTrack, existing.trackId == track.trackId {
             return
         }
@@ -280,13 +449,15 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         pipController.setPiPContentReady(true)
         pipController.requestStart()
         startStatsProbeIfNeeded()
-        onStreamingChanged?(true)
+        if let source = currentMediaSource() {
+            onStreamingChanged?(source, true)
+        }
 
         info("pip.start.request reason=track-attached trackId=\(track.trackId)")
         log("track.attach kind=video trackId=\(track.trackId)")
     }
 
-    private func attachRemoteAudioTrack(_ track: RTCAudioTrack) {
+    private func attachRemoteAudioTrack(_ track: LKRTCAudioTrack) {
         if let existing = remoteAudioTrack, existing.trackId == track.trackId {
             return
         }
@@ -297,18 +468,33 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         startStatsProbeIfNeeded()
     }
 
-    private func handleConnectionStateChange(_ newState: RTCPeerConnectionState) {
+    private func handleConnectionStateChange(_ newState: LKRTCPeerConnectionState) {
         currentConnectionState = newState
         info("webrtc.connectionState.changed value=\(newState.rawValue)")
         log("webrtc.connectionState=\(newState.rawValue)")
         if Self.terminalConnectionStates.contains(newState) {
-            onStreamingChanged?(false)
+            clearActivePeerConnection(notifyStreamingStopped: true)
             pipController.stop()
         }
     }
 
-    private func handleGeneratedLocalCandidate(_ candidate: RTCIceCandidate) {
-        guard let tabId = currentTabId, let videoId = currentVideoId else {
+    private func handleGeneratedLocalCandidate(_ candidate: LKRTCIceCandidate) {
+        guard let tabId = currentTabId,
+              let videoId = currentVideoId,
+              let generation = currentGeneration
+        else {
+            return
+        }
+        guard localIceCandidateCount
+                < ProtocolLimits.maximumPendingICECandidates
+        else {
+            FloatLog.media.error("Local ICE candidate count exceeded protocol limit")
+            return
+        }
+        guard !candidate.sdp.isEmpty,
+              candidate.sdp.utf8.count <= ProtocolLimits.maximumICECandidateBytes
+        else {
+            FloatLog.media.error("Local ICE candidate size exceeded protocol limit")
             return
         }
         localIceCandidateCount += 1
@@ -316,6 +502,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         let payload = LocalIceCandidate(
             tabId: tabId,
             videoId: videoId,
+            generation: generation,
             candidate: candidate.sdp,
             sdpMid: candidate.sdpMid,
             sdpMLineIndex: Int(candidate.sdpMLineIndex)
@@ -323,7 +510,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         onLocalIceCandidate?(payload)
     }
 
-    private func setRemoteDescription(_ description: RTCSessionDescription, on connection: RTCPeerConnection) async throws {
+    private func setRemoteDescription(_ description: LKRTCSessionDescription, on connection: LKRTCPeerConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.setRemoteDescription(description) { error in
                 if let error {
@@ -336,7 +523,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
 
-    private func setLocalDescription(_ description: RTCSessionDescription, on connection: RTCPeerConnection) async throws {
+    private func setLocalDescription(_ description: LKRTCSessionDescription, on connection: LKRTCPeerConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.setLocalDescription(description) { error in
                 if let error {
@@ -348,10 +535,10 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
     }
 
-    private func createAnswer(on connection: RTCPeerConnection) async throws -> RTCSessionDescription {
+    private func createAnswer(on connection: LKRTCPeerConnection) async throws -> LKRTCSessionDescription {
         let constraints = makeMediaConstraints()
 
-        let answer: RTCSessionDescription = try await withCheckedThrowingContinuation { continuation in
+        let answer: LKRTCSessionDescription = try await withCheckedThrowingContinuation { continuation in
             connection.answer(for: constraints) { sdp, error in
                 if let error {
                     continuation.resume(throwing: error)
@@ -367,7 +554,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         
         // Ensure answer SDP preserves high-quality Opus parameters from offer
         let manipulatedSdp = preserveOpusQualityInAnswer(sdp: answer.sdp)
-        return RTCSessionDescription(type: .answer, sdp: manipulatedSdp)
+        return LKRTCSessionDescription(type: .answer, sdp: manipulatedSdp)
     }
     
     private func preserveOpusQualityInAnswer(sdp: String) -> String {
@@ -438,7 +625,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         return resultLines.joined(separator: "\r\n")
     }
 
-    private func addIceCandidate(_ candidate: RTCIceCandidate, to connection: RTCPeerConnection) async throws {
+    private func addIceCandidate(_ candidate: LKRTCIceCandidate, to connection: LKRTCPeerConnection) async throws {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
             connection.add(candidate) { error in
                 if let error {
@@ -450,22 +637,67 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
     }
 
-    private func flushPendingRemoteCandidates(on connection: RTCPeerConnection) async throws {
+    private func ownsReceiverSession(
+        _ receiverSessionEpoch: UInt64,
+        connection: LKRTCPeerConnection
+    ) -> Bool {
+        receiverSessions.matches(receiverSessionEpoch) &&
+            peerConnection === connection
+    }
+
+    private func requireActiveReceiverSession(
+        _ receiverSessionEpoch: UInt64,
+        connection: LKRTCPeerConnection
+    ) throws {
+        guard !Task.isCancelled,
+              ownsReceiverSession(
+                  receiverSessionEpoch,
+                  connection: connection
+              )
+        else {
+            throw NativeReceiverSessionError.superseded
+        }
+    }
+
+    private func disposeSupersededConnection(
+        _ connection: LKRTCPeerConnection
+    ) {
+        connection.delegate = nil
+        connection.close()
+    }
+
+    private func flushPendingRemoteCandidates(
+        on connection: LKRTCPeerConnection,
+        receiverSessionEpoch: UInt64
+    ) async throws {
+        try requireActiveReceiverSession(
+            receiverSessionEpoch,
+            connection: connection
+        )
         guard connection.remoteDescription != nil else {
             return
         }
 
-        while !pendingRemoteCandidates.isEmpty {
-            let candidate = pendingRemoteCandidates.removeFirst()
+        while let candidate = receiverSessions.dequeue(
+            for: receiverSessionEpoch
+        ) {
+            try requireActiveReceiverSession(
+                receiverSessionEpoch,
+                connection: connection
+            )
             try await addIceCandidate(candidate, to: connection)
+            try requireActiveReceiverSession(
+                receiverSessionEpoch,
+                connection: connection
+            )
         }
     }
 
-    private func makeMediaConstraints() -> RTCMediaConstraints {
+    private func makeMediaConstraints() -> LKRTCMediaConstraints {
         let mandatory: [String: String] = [
-            kRTCMediaConstraintsOfferToReceiveAudio: kRTCMediaConstraintsValueTrue,
-            kRTCMediaConstraintsOfferToReceiveVideo: kRTCMediaConstraintsValueTrue,
-            kRTCMediaConstraintsVoiceActivityDetection: kRTCMediaConstraintsValueFalse,
+            kLKRTCMediaConstraintsOfferToReceiveAudio: kLKRTCMediaConstraintsValueTrue,
+            kLKRTCMediaConstraintsOfferToReceiveVideo: kLKRTCMediaConstraintsValueTrue,
+            kLKRTCMediaConstraintsVoiceActivityDetection: kLKRTCMediaConstraintsValueFalse,
         ]
         let optional: [String: String] = [
             "googEchoCancellation": "false",
@@ -474,21 +706,64 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             "googHighpassFilter": "false",
             "googAudioMirroring": "false",
         ]
-        return RTCMediaConstraints(mandatoryConstraints: mandatory, optionalConstraints: optional)
+        return LKRTCMediaConstraints(mandatoryConstraints: mandatory, optionalConstraints: optional)
     }
 
-    private func queueRemoteCandidate(_ candidate: RTCIceCandidate) {
-        pendingRemoteCandidates.append(candidate)
+    private func queueRemoteCandidate(
+        _ candidate: LKRTCIceCandidate,
+        receiverSessionEpoch: UInt64
+    ) throws {
+        switch receiverSessions.enqueue(
+            candidate,
+            for: receiverSessionEpoch,
+            limit: ProtocolLimits.maximumPendingICECandidates
+        ) {
+        case .enqueued:
+            return
+        case .staleSession:
+            throw NativeReceiverSessionError.superseded
+        case .limitReached:
+            throw ProtocolValidationError.limitExceeded("pending ICE candidates")
+        }
     }
 
     private func resetActiveSource() {
+        activePiPPresentationSource = nil
         currentTabId = nil
         currentVideoId = nil
+        currentGeneration = nil
+    }
+
+    private func currentMediaSource() -> WebRTCMediaSource? {
+        guard let tabId = currentTabId,
+              let videoId = currentVideoId,
+              let generation = currentGeneration
+        else {
+            return nil
+        }
+        return WebRTCMediaSource(
+            tabId: tabId,
+            videoId: videoId,
+            generation: generation
+        )
+    }
+
+    private func activePresentationMediaSource() -> WebRTCMediaSource? {
+        guard let source = activePiPPresentationSource,
+              receiverSessions.matches(source.receiverSessionEpoch)
+        else {
+            return nil
+        }
+        return WebRTCMediaSource(
+            tabId: source.tabId,
+            videoId: source.videoId,
+            generation: source.generation
+        )
     }
 
     private func log(_ message: String) {
         guard debugLoggingEnabled else { return }
-        print("[Float NativeRTC] \(message)")
+        FloatLog.debug(FloatLog.media, message)
     }
 
     private func serializeForLog(_ value: Any) -> String {
@@ -505,12 +780,12 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         guard let connection = peerConnection else { return }
 
         let payload: [[String: Any]] = connection.receivers.compactMap { receiver in
-            guard let track = receiver.track, track.kind == kRTCMediaStreamTrackKindAudio else {
+            guard let track = receiver.track, track.kind == kLKRTCMediaStreamTrackKindAudio else {
                 return nil
             }
 
             let codecs = receiver.parameters.codecs
-                .filter { $0.kind == kRTCMediaStreamTrackKindAudio }
+                .filter { $0.kind == kLKRTCMediaStreamTrackKindAudio }
                 .map { codec in
                     [
                         "payloadType": codec.payloadType,
@@ -587,11 +862,18 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func collectReceiverStats() {
-        guard let connection = peerConnection else { return }
+        guard let connection = peerConnection,
+              let receiverSessionEpoch = receiverSessions.current
+        else {
+            return
+        }
 
         connection.statistics { [weak self] report in
             Task { @MainActor [weak self] in
                 guard let self else { return }
+                guard self.receiverSessions.matches(receiverSessionEpoch) else {
+                    return
+                }
                 self.updateVideoDiagnosticsOverlay(using: report)
                 self.logTransportCandidatePairStats(report)
                 self.logReceiverAudioStats(report)
@@ -599,7 +881,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
     }
 
-    private func updateVideoDiagnosticsOverlay(using report: RTCStatisticsReport) {
+    private func updateVideoDiagnosticsOverlay(using report: LKRTCStatisticsReport) {
         guard diagnosticsOverlayEnabled else {
             pipController.updateDiagnosticsOverlay(nil)
             return
@@ -610,7 +892,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             return
         }
 
-        var selectedStat: RTCStatistics?
+        var selectedStat: LKRTCStatistics?
         for (_, stat) in report.statistics where stat.type == "inbound-rtp" {
             let values = stat.values
             let kind = (values["kind"] as? String) ?? (values["mediaType"] as? String)
@@ -801,8 +1083,8 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         return Int(value.rounded())
     }
 
-    private func logReceiverAudioStats(_ report: RTCStatisticsReport) {
-        let codecById = report.statistics.reduce(into: [String: RTCStatistics]()) { result, pair in
+    private func logReceiverAudioStats(_ report: LKRTCStatisticsReport) {
+        let codecById = report.statistics.reduce(into: [String: LKRTCStatistics]()) { result, pair in
             let stat = pair.value
             if stat.type == "codec" {
                 result[pair.key] = stat
@@ -868,11 +1150,11 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 
     private func info(_ message: String) {
-        print("[Float NativeRTC] \(message)")
+        FloatLog.debug(FloatLog.media, message)
     }
 
-    private func logTransportCandidatePairStats(_ report: RTCStatisticsReport) {
-        var selectedPair: RTCStatistics?
+    private func logTransportCandidatePairStats(_ report: LKRTCStatisticsReport) {
+        var selectedPair: LKRTCStatistics?
         for (_, stat) in report.statistics where stat.type == "candidate-pair" {
             let selected = stat.values["selected"] as? Bool
             let nominated = stat.values["nominated"] as? Bool
@@ -901,17 +1183,25 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     }
 }
 
-extension NativeLibWebRTCReceiver: RTCPeerConnectionDelegate {
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange stateChanged: RTCSignalingState) {
+extension NativeLibWebRTCReceiver: LKRTCPeerConnectionDelegate {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didChange stateChanged: LKRTCSignalingState) {
         _ = peerConnection
         Task { @MainActor [weak self] in
             self?.info("webrtc.signalingState.changed value=\(stateChanged.rawValue)")
         }
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didAdd stream: RTCMediaStream) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didAdd stream: LKRTCMediaStream) {
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard let receiverSessionEpoch = self.receiverSessions.current,
+                  self.ownsReceiverSession(
+                      receiverSessionEpoch,
+                      connection: peerConnection
+                  )
+            else {
+                return
+            }
             for videoTrack in stream.videoTracks {
                 self.attachRemoteVideoTrack(videoTrack)
             }
@@ -921,69 +1211,90 @@ extension NativeLibWebRTCReceiver: RTCPeerConnectionDelegate {
         }
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didRemove stream: RTCMediaStream) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didRemove stream: LKRTCMediaStream) {
         _ = peerConnection
         _ = stream
     }
 
-    nonisolated func peerConnectionShouldNegotiate(_ peerConnection: RTCPeerConnection) {
+    nonisolated func peerConnectionShouldNegotiate(_ peerConnection: LKRTCPeerConnection) {
         _ = peerConnection
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceConnectionState) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didChange newState: LKRTCIceConnectionState) {
         _ = peerConnection
         Task { @MainActor [weak self] in
             self?.info("webrtc.iceConnectionState.changed value=\(newState.rawValue)")
         }
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCIceGatheringState) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didChange newState: LKRTCIceGatheringState) {
         _ = peerConnection
         Task { @MainActor [weak self] in
             self?.info("webrtc.iceGatheringState.changed value=\(newState.rawValue)")
         }
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didGenerate candidate: RTCIceCandidate) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didGenerate candidate: LKRTCIceCandidate) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard self.peerConnection === peerConnection else { return }
+            guard let receiverSessionEpoch = self.receiverSessions.current,
+                  self.ownsReceiverSession(
+                      receiverSessionEpoch,
+                      connection: peerConnection
+                  )
+            else {
+                return
+            }
             self.handleGeneratedLocalCandidate(candidate)
         }
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didRemove candidates: [RTCIceCandidate]) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didRemove candidates: [LKRTCIceCandidate]) {
         _ = peerConnection
         _ = candidates
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didOpen dataChannel: RTCDataChannel) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didOpen dataChannel: LKRTCDataChannel) {
         _ = peerConnection
         _ = dataChannel
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didChange newState: RTCPeerConnectionState) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didChange newState: LKRTCPeerConnectionState) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard self.peerConnection === peerConnection else { return }
+            guard let receiverSessionEpoch = self.receiverSessions.current,
+                  self.ownsReceiverSession(
+                      receiverSessionEpoch,
+                      connection: peerConnection
+                  )
+            else {
+                return
+            }
             self.handleConnectionStateChange(newState)
         }
     }
 
     nonisolated func peerConnection(
-        _ peerConnection: RTCPeerConnection,
-        didAdd rtpReceiver: RTCRtpReceiver,
-        streams mediaStreams: [RTCMediaStream]
+        _ peerConnection: LKRTCPeerConnection,
+        didAdd rtpReceiver: LKRTCRtpReceiver,
+        streams mediaStreams: [LKRTCMediaStream]
     ) {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            guard self.peerConnection === peerConnection else { return }
+            guard let receiverSessionEpoch = self.receiverSessions.current,
+                  self.ownsReceiverSession(
+                      receiverSessionEpoch,
+                      connection: peerConnection
+                  )
+            else {
+                return
+            }
 
-            if let videoTrack = rtpReceiver.track as? RTCVideoTrack {
+            if let videoTrack = rtpReceiver.track as? LKRTCVideoTrack {
                 self.attachRemoteVideoTrack(videoTrack)
                 return
             }
-            if let audioTrack = rtpReceiver.track as? RTCAudioTrack {
+            if let audioTrack = rtpReceiver.track as? LKRTCAudioTrack {
                 self.attachRemoteAudioTrack(audioTrack)
                 self.logCurrentAudioReceiverParameters(context: "didAddReceiver.audioTrack")
             }
@@ -999,23 +1310,25 @@ extension NativeLibWebRTCReceiver: RTCPeerConnectionDelegate {
         }
     }
 
-    nonisolated func peerConnection(_ peerConnection: RTCPeerConnection, didRemove rtpReceiver: RTCRtpReceiver) {
+    nonisolated func peerConnection(_ peerConnection: LKRTCPeerConnection, didRemove rtpReceiver: LKRTCRtpReceiver) {
         _ = peerConnection
         _ = rtpReceiver
     }
 }
 
-extension NativeLibWebRTCReceiver: RTCVideoViewDelegate {
-    nonisolated func videoView(_ videoView: RTCVideoRenderer, didChangeVideoSize size: CGSize) {
+extension NativeLibWebRTCReceiver: LKRTCVideoViewDelegate {
+    nonisolated func videoView(_ videoView: LKRTCVideoRenderer, didChangeVideoSize size: CGSize) {
         _ = videoView
         Task { @MainActor [weak self] in
             guard let self else { return }
+            guard self.peerConnection != nil,
+                  self.remoteVideoTrack != nil
+            else {
+                return
+            }
             guard size.width > 0, size.height > 0 else { return }
             self.lastReportedVideoSize = size
             self.pipController.updateExpectedVideoSize(size)
-            self.pipController.setPiPContentReady(true)
-            self.pipController.requestStart()
-            self.onStreamingChanged?(true)
         }
     }
 }
