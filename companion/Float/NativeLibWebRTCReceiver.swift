@@ -82,7 +82,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     //   - 192000 (192 kbps): Very good quality, balanced
     //   - 256000 (256 kbps): Excellent quality (default)
     //   - 510000 (510 kbps): Maximum Opus quality
-    private static let opusTargetBitrateBps: Int = 256_000
+    private static let opusTargetBitrateBps: Int = 128_000
     // ========================================================================
     
     private static let terminalConnectionStates: Set<LKRTCPeerConnectionState> = [
@@ -618,10 +618,13 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             if line.hasPrefix("m=audio") {
                 inAudioSection = true
                 resultLines.append(line)
-                // Add bandwidth constraints
-                let bandwidthKbps = Self.opusTargetBitrateBps / 1000
-                resultLines.append("b=AS:\(bandwidthKbps)")
-                resultLines.append("b=TIAS:\(Self.opusTargetBitrateBps)")
+                // No b=AS/b=TIAS: `maxaveragebitrate` below already pins the
+                // Opus rate. A media-level bandwidth line would additionally
+                // reserve that budget inside the shared BUNDLE estimate, which
+                // starves the video encoder during bandwidth ramp-up and makes
+                // video latency (and therefore lip sync) unstable. It was also
+                // emitted before the `c=` line, which violates RFC 4566 line
+                // ordering.
                 continue
             } else if line.hasPrefix("m=") {
                 inAudioSection = false
@@ -643,7 +646,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
                 continue
             }
             
-            // Skip existing bandwidth lines in audio section
+            // Drop media-level audio bandwidth limits entirely (see above).
             if inAudioSection && (line.hasPrefix("b=AS:") || line.hasPrefix("b=TIAS:")) {
                 continue
             }
@@ -1009,7 +1012,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         if let rttMs {
             overlayParts.append(String(format: "%.0f ms", rttMs))
         }
-        
+
         if let state = currentConnectionState {
             let stateText: String
             switch state {

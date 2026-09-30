@@ -102,7 +102,7 @@ const scheduledVideoEvents = [
 //   - 192000 (192 kbps): Very good quality, balanced
 //   - 256000 (256 kbps): Excellent quality (default)
 //   - 510000 (510 kbps): Maximum Opus quality
-const FLOAT_OPUS_BITRATE_BPS = 256_000;
+const FLOAT_OPUS_BITRATE_BPS = 128_000;
 const FLOAT_OPUS_CHANNELS = 2; // Stereo audio
 // ============================================================================
 
@@ -110,8 +110,8 @@ const FLOAT_MAX_VIDEO_FPS = 60;
 const FLOAT_AUDIO_MAX_BITRATE_BPS = 510_000;
 const FLOAT_VIDEO_MAX_SCALE_DOWN_BY = 8;
 const FLOAT_VIDEO_SCALE_CHANGE_EPSILON = 0.02;
-const FLOAT_VIDEO_MIN_BITRATE_BPS = 4_000_000;
-const FLOAT_VIDEO_MAX_BITRATE_BPS = 36_000_000;
+const FLOAT_VIDEO_MIN_BITRATE_BPS = 600_000;
+const FLOAT_VIDEO_MAX_BITRATE_BPS = 6_000_000;
 const FLOAT_VIDEO_TARGET_BITS_PER_PIXEL = 0.11;
 const FLOAT_MAX_ICE_CANDIDATES = 256;
 const FLOAT_MAX_ICE_CANDIDATE_BYTES = 8 * 1024;
@@ -251,13 +251,11 @@ function forceOpusCodec(sdp: string): string {
       } else {
         outputLines.push(line);
       }
-      // Add bandwidth constraint right after m=audio line
-      outputLines.push(`b=AS:${Math.ceil(FLOAT_OPUS_BITRATE_BPS / 1000)}`); // AS bandwidth in kbps
-      outputLines.push(`b=TIAS:${FLOAT_OPUS_BITRATE_BPS}`); // TIAS bandwidth in bps
-      debugLog("forceOpusCodec.bandwidth", {
-        AS: Math.ceil(FLOAT_OPUS_BITRATE_BPS / 1000),
-        TIAS: FLOAT_OPUS_BITRATE_BPS,
-      });
+      // No b=AS/b=TIAS here: the Opus rate is already pinned through
+      // `maxaveragebitrate` in the fmtp line below. A media-level bandwidth
+      // limit additionally reserves that budget inside the shared BUNDLE
+      // estimate, which starves the video encoder while bandwidth ramps up
+      // and makes video latency (and therefore lip sync) unstable.
       continue;
     } else if (line.startsWith('m=')) {
       // Before leaving audio section, ensure we have fmtp
@@ -328,7 +326,7 @@ function forceOpusCodec(sdp: string): string {
     }
 
     if (line.startsWith('b=AS:') || line.startsWith('b=TIAS:')) {
-      // Skip existing bandwidth lines, we add our own
+      // Drop media-level audio bandwidth limits entirely (see above).
       continue;
     }
 
