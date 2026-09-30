@@ -120,6 +120,8 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
     private let pipController = NativePiPController()
     private let peerConnectionFactory: LKRTCPeerConnectionFactory
     private let videoView: LKRTCMTLVideoView
+    private let avSyncProbe: AVSyncProbe?
+    private var lastPlayoutDelaySample: (totalDelay: Double, samples: Double)?
 
     private var peerConnection: LKRTCPeerConnection?
     private var remoteVideoTrack: LKRTCVideoTrack?
@@ -164,6 +166,9 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
 
         peerConnectionFactory = LKRTCPeerConnectionFactory()
         videoView = LKRTCMTLVideoView(frame: .zero)
+        avSyncProbe = AVSyncProbe.isEnabled
+            ? AVSyncProbe(displayLatency: 1.0 / Double(max(NSScreen.main?.maximumFramesPerSecond ?? 60, 1)))
+            : nil
 
         super.init()
 
@@ -232,7 +237,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         }
     }
 
-    func handleOffer(_ offer: OfferMessage) async throws -> String {
+    func handleOffer(_ offer: OfferMessage, lipSync: LipSyncMode) async throws -> String {
         info("offer.received tabId=\(offer.tabId) videoId=\(offer.videoId) sdpLength=\(offer.sdp.count)")
         activePiPPresentationSource = nil
         pipController.setPiPContentReady(false)
@@ -248,7 +253,15 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
         peerConnection = connection
 
         do {
-            let remoteOffer = LKRTCSessionDescription(type: .offer, sdp: offer.sdp)
+            let offerSDP: String
+            switch lipSync {
+            case .webRTC:
+                offerSDP = offer.sdp
+            case .disabled:
+                offerSDP = LipSyncSDP.separatingAudioSyncGroup(in: offer.sdp)
+            }
+            info("offer.lipSync mode=\(lipSync)")
+            let remoteOffer = LKRTCSessionDescription(type: .offer, sdp: offerSDP)
             try await setRemoteDescription(remoteOffer, on: connection)
             try requireActiveReceiverSession(receiverSessionEpoch, connection: connection)
             info("offer.remoteDescription.applied")
@@ -417,10 +430,18 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
 
         if let remoteVideoTrack {
             remoteVideoTrack.remove(videoView)
+            if let avSyncProbe {
+                remoteVideoTrack.remove(avSyncProbe)
+            }
             self.remoteVideoTrack = nil
         }
 
+        if let remoteAudioTrack, let avSyncProbe {
+            remoteAudioTrack.remove(avSyncProbe)
+        }
         remoteAudioTrack = nil
+        avSyncProbe?.reset()
+        lastPlayoutDelaySample = nil
 
         if let connection = peerConnection {
             connection.delegate = nil
@@ -441,11 +462,17 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
 
         if let existing = remoteVideoTrack {
             existing.remove(videoView)
+            if let avSyncProbe {
+                existing.remove(avSyncProbe)
+            }
         }
 
         remoteVideoTrack = track
         track.isEnabled = true
         track.add(videoView)
+        if let avSyncProbe {
+            track.add(avSyncProbe)
+        }
         pipController.setPiPContentReady(true)
         pipController.requestStart()
         startStatsProbeIfNeeded()
@@ -462,8 +489,14 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             return
         }
 
+        if let existing = remoteAudioTrack, let avSyncProbe {
+            existing.remove(avSyncProbe)
+        }
         remoteAudioTrack = track
         track.isEnabled = true
+        if let avSyncProbe {
+            track.add(avSyncProbe)
+        }
         log("track.attach kind=audio trackId=\(track.trackId)")
         startStatsProbeIfNeeded()
     }
@@ -877,6 +910,7 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
                 self.updateVideoDiagnosticsOverlay(using: report)
                 self.logTransportCandidatePairStats(report)
                 self.logReceiverAudioStats(report)
+                self.updateAVSyncProbe(using: report)
             }
         }
     }
@@ -1081,6 +1115,29 @@ final class NativeLibWebRTCReceiver: NSObject, WebRTCReceiver {
             return nil
         }
         return Int(value.rounded())
+    }
+
+    /// Feeds the A/V sync probe with the audio playout delay the audio device
+    /// module reports (`media-playout` stats), falling back to the latency
+    /// CoreAudio reports for the default output device.
+    private func updateAVSyncProbe(using report: LKRTCStatisticsReport) {
+        guard let avSyncProbe else { return }
+        let playout = report.statistics.values.first { $0.type == "media-playout" }
+        if let playout,
+           let totalDelay = readDoubleStatValue(playout.values["totalPlayoutDelay"]),
+           let samples = readDoubleStatValue(playout.values["totalSamplesCount"]) {
+            defer { lastPlayoutDelaySample = (totalDelay, samples) }
+            if let last = lastPlayoutDelaySample, samples > last.samples {
+                avSyncProbe.updateAudioPlayoutDelay(
+                    (totalDelay - last.totalDelay) / (samples - last.samples),
+                    source: "media-playout"
+                )
+                return
+            }
+        }
+        if let latency = AVSyncProbe.defaultOutputDeviceLatency() {
+            avSyncProbe.updateAudioPlayoutDelay(latency, source: "coreaudio")
+        }
     }
 
     private func logReceiverAudioStats(_ report: LKRTCStatisticsReport) {

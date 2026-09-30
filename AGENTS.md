@@ -78,5 +78,6 @@ Then run packaging scripts and load either staged build output:
 
 - Protocol version is `1` on both sides.
 - PiP uses private `PIP.framework` APIs; this is suitable for local/dev usage and may not be App Store-safe. Public AVKit sample buffer PiP was evaluated on macOS 27 and rejected; see `docs/PUBLIC_PIP.md` (includes a repro probe) before attempting it again.
+- Chrome's `captureStream()` stamps audio about `2 × output delay` too early, so the companion disables WebRTC lip sync for Chrome sources (`LipSyncMode`). See `docs/AV_SYNC.md` for measurements and the `-FloatAVSyncProbe` measuring setup.
 - `receiver.html` must be present in the app bundle at runtime for the WK receiver to initialize.
 - Pairing/auth hardening is not implemented yet; signaling is trusted localhost.

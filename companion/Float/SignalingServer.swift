@@ -1251,7 +1251,8 @@ final class SignalingServer: ObservableObject {
             activeVideoId = offer.videoId
             activeGeneration = offer.generation
             lastVideoQualityHint = nil
-            let answerSDP = try await webRTCReceiver.handleOffer(offer)
+            let lipSync = LipSyncMode(extensionOrigin: clientContexts[clientID]?.origin ?? "")
+            let answerSDP = try await webRTCReceiver.handleOffer(offer, lipSync: lipSync)
             guard !Task.isCancelled,
                   mediaOperationID == operationID,
                   authenticatedClients.contains(clientID),
