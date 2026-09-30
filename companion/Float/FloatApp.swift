@@ -27,8 +27,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @MainActor
 private final class StatusBarController: NSObject, NSMenuDelegate {
     private let signalingServer: SignalingServer
-    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    private let statusItem = StatusBarController.makeStatusItem()
     private var cancellables = Set<AnyCancellable>()
+
+    private static func makeStatusItem() -> NSStatusItem {
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        item.autosaveName = "de.unsou.Float.status-item"
+        let icon = NSImage(
+            systemSymbolName: "rectangle.slash",
+            accessibilityDescription: "Float"
+        )
+        icon?.isTemplate = true
+        item.button?.image = icon
+        item.button?.imagePosition = .imageOnly
+        item.isVisible = true
+        return item
+    }
 
     init(signalingServer: SignalingServer) {
         self.signalingServer = signalingServer
@@ -44,6 +58,7 @@ private final class StatusBarController: NSObject, NSMenuDelegate {
         button.action = #selector(handleStatusItemClick(_:))
         button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         button.imagePosition = .imageOnly
+        button.toolTip = "Float"
     }
 
     private func bindState() {
