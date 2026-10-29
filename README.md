@@ -200,9 +200,7 @@ means Float can't ship through the Mac App Store.
 
 ## Contributing
 
-Issues and pull requests are welcome, especially from macOS developers. Float
-was built quickly by someone who is not primarily a Swift developer, so there
-may be better approaches, for example a stable route through public APIs.
+Issues and pull requests are welcome, especially from macOS developers.
 
 If Float is useful to you, a ⭐ on GitHub helps other people find it.
 
@@ -226,21 +224,13 @@ corepack enable
 yarn --cwd extension install --frozen-lockfile
 yarn --cwd extension test
 ./scripts/build-all.sh
-./scripts/pack-all.sh
-./scripts/hash-artifacts.sh
 ```
-
-These are development artifacts. The public release command is fail-closed and
-requires both a Developer ID Application identity and a `notarytool` Keychain
-profile; see the release checklist.
 
 Extension-only commands:
 
 ```bash
 ./scripts/build-chrome.sh
 ./scripts/build-firefox.sh
-./scripts/pack-chrome.sh
-./scripts/pack-firefox.sh
 ```
 
 Companion tests and an unsigned local build:
@@ -254,21 +244,7 @@ xcodebuild test \
   -configuration Debug \
   -destination 'platform=macOS,arch=arm64' \
   CODE_SIGNING_ALLOWED=NO
-
-xcodebuild build \
-  -project companion/Float.xcodeproj \
-  -scheme Float \
-  -configuration Release \
-  -destination 'generic/platform=macOS' \
-  ARCHS='arm64 x86_64' \
-  ONLY_ACTIVE_ARCH=NO \
-  CODE_SIGNING_ALLOWED=NO
 ```
-
-Distribution builds require an Apple-issued Developer ID identity so the
-Hardened Runtime app and embedded WebRTC framework share a Team Identifier.
-Follow [`docs/RELEASE_CHECKLIST.md`](docs/RELEASE_CHECKLIST.md); do not weaken
-library validation for local or CI builds.
 
 ## License
 
