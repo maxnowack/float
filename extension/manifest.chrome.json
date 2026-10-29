@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Float",
   "version": "0.3.0",
-  "description": "Detects playing videos and coordinates with the Float macOS companion.",
+  "description": "Native macOS Picture-in-Picture for any web video. Stays on top of fullscreen apps and Spaces. Requires the Float Mac app.",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",
